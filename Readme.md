@@ -1,33 +1,46 @@
-"8: Common Beginner Mistakes to Avoid
-Lookahead Bias: This is the deadliest sin in quantitative finance. If your 1-hour candle logic uses the "Close" price to make a decision at 10:15 AM, you are peeking into the future. You only know the 1H close at 11:00 AM. Your engine must enforce temporal strictness.
+# Quantitative ICT Backtesting Engine
 
-The CSV Trap: 10 years of 1-minute data for two assets is roughly 7 million rows. Loading this from CSV every time you run a test will waste hours of your life. Convert your raw CSVs to Parquet format immediately. It is strongly typed, highly compressed, and loads 10x to 50x faster in Pandas.
+An event-driven, high-precision backtesting framework designed specifically for NQ and ES futures. This project translates highly subjective Inner Circle Trader (ICT) concepts—such as Market Structure Shifts (CHoCH), Break of Structure (BOS), and Macro Session Liquidity—into strict, stateless algorithmic logic. 
 
-Rigid Coupling: Tying your strategy logic directly to your broker simulation. If you want to change how a BOS is calculated, you shouldn't have to touch the TradeManager.
+Built entirely in Python, the engine processes 1-minute tick data to execute gap-aware structural analysis. It is engineered to bridge the gap between discretionary price action concepts and rigorous quantitative verification.
 
-Premature Optimization: Trying to make the backtest run in milliseconds before verifying it is mathematically correct. Build it accurately first; make it fast later.
+## Core Design Principles
 
-9: 18-Month Development Roadmap
-Data & Primitives
-Months 1-3
-Implement Parquet data loading, strict timeframe resampling (1m to 4H), and write comprehensive Pytest coverage to ensure data integrity.
+*   **Zero Lookahead Bias:** The deadliest sin in quantitative finance is peeking into the future. This engine enforces strict temporal boundaries; all structural and entry logic is evaluated strictly on closed candle states to ensure mathematically valid test results.
+*   **High-Performance Data Pipeline:** Intraday testing across years of 1-minute data generates millions of rows. The engine bypasses traditional CSV loading in favor of Parquet, providing highly compressed, strongly typed data that loads exponentially faster in Pandas.
+*   **Modular Architecture:** Strategy logic is decoupled from broker simulation. Modifications to how a BOS or swing point is calculated do not require re-engineering the core portfolio or execution manager.
+*   **Accuracy Over Speed:** The primary objective is absolute mathematical precision and visual chart alignment over raw execution speed. Optimization and microsecond processing are deferred until the foundational logic is perfectly mapped to human discretion.
 
-Domain Logic Translation
-Months 4-6
-Translate subjective concepts (Swings, Liquidity, BOS, CHoCH) into pure, stateless Python functions. Output these markers visually using Plotly to verify they match human discretion.
+## Development Roadmap
 
-Event-Driven Engine
-Months 7-9
-Build the broker.py and portfolio.py. Create the time-stepping loop that feeds data to the strategy minute-by-minute without leaking future data.
+This project follows an 18-month staged development lifecycle, currently actively executing Phase 2.
 
-Strategy Implementation
-Months 10-12
-Combine the multi-timeframe signals. Implement the specific entry models, stop-loss logic, and take-profit targets based on the domain definitions.
+### Phase 1: Data & Primitives (Months 1-3)
+*   [x] Implement highly optimized Parquet data loading infrastructure.
+*   [x] Establish strict timeframe resampling engines (1m up to 4H).
+*   [ ] Write comprehensive Pytest coverage to ensure baseline data integrity.
 
-Analytics & Reporting
-Months 13-15
-Develop the tear sheets. Calculate Sharpe ratio, maximum drawdown, win rate, and profit factor. Implement logging to trace every decision the engine makes.
+### Phase 2: Domain Logic Translation (Months 4-6)
+*   [x] Translate subjective swings into pure, stateless Python functions.
+*   [x] Develop gap-aware structural break detection (BOS / CHoCH).
+*   [x] Implement macro session liquidity pooling (Asia / London).
+*   [ ] Output domain markers visually using Plotly to verify visual chart alignment.
 
-Optimization & UI
-Months 16-18
-Parameterize the strategy for grid searching (e.g., testing different required distances for a liquidity sweep). Optionally integrate PySide6 for a desktop control panel and write the final thesis documentation.
+### Phase 3: Event-Driven Engine (Months 7-9)
+*   [ ] Build the localized `broker.py` and `portfolio.py` execution modules.
+*   [ ] Create the time-stepping loop that feeds data to the strategy minute-by-minute without leaking future data.
+
+### Phase 4: Strategy Implementation (Months 10-12)
+*   [ ] Combine multi-timeframe signals into actionable trade logic.
+*   [ ] Implement programmatic entry models (e.g., Fair Value Gaps, Order Blocks).
+*   [ ] Construct dynamic stop-loss logic and take-profit targeting based on structural domain definitions.
+
+### Phase 5: Analytics & Reporting (Months 13-15)
+*   [ ] Develop comprehensive tear sheets for performance review.
+*   [ ] Calculate core quantitative metrics: Sharpe ratio, maximum drawdown, win rate, and profit factor.
+*   [ ] Implement deep-trace logging to record every execution decision the engine makes.
+
+### Phase 6: Optimization & UI (Months 16-18)
+*   [ ] Parameterize the strategy for grid searching (e.g., testing optimal required tick distances for liquidity sweeps).
+*   [ ] Optionally integrate PySide6 for a local desktop control panel.
+*   [ ] Finalize thesis documentation and methodology reporting.
