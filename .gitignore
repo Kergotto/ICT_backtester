@@ -1,0 +1,14 @@
+# Development Environment and Cache
+.idea/
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Data files (to avoid uploading gigabytes of quotes)
+*.csv
+*.parquet
+
+# Files Containing Secrets
+.env
