@@ -46,7 +46,8 @@ def test_bullish_liquidity_sweep():
     target_pool = ssl_pools[0]
 
     # Verify the pool grabbed the correct price level
-    assert target_pool.lower_bound == 4000.0, f"Expected pool at 3998.0, got {target_pool.lower_bound}"
+    # Verify the pool stretched its boundary to the sweeping wick tip (3998.0)
+    assert target_pool.lower_bound == 3998.0, f"Expected pool at 4000.0, got {target_pool.lower_bound}"
 
     # Verify the boolean state flipped
     assert target_pool.has_been_swept == True, "Engine failed to mark the pool state as swept."

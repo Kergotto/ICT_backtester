@@ -28,7 +28,7 @@ def download_recent_futures(symbol: str, filename: str) -> None:
     df = df.reset_index()
 
     # Ensure the output directory exists
-    output_dir = Path("C:/Users/Home/PycharmProjects/ICT_Backtester/data")
+    output_dir = Path("C:/Users/Кирил/PycharmProjects/ICT_Backtester/ICT_Backtester/data")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     output_path = output_dir / filename

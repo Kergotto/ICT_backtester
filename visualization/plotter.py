@@ -46,40 +46,50 @@ def plot_liquidity_chart(df: pd.DataFrame, pools: List[LiquidityPool], swings: L
     ))
 
     chart_start_time = df.index[0]
+    chart_end_time = df.index[-1]
+    chart_max_high = df['high'].max()
+    chart_min_low = df['low'].min()
 
     for pool in pools:
-        if not pool.is_active:
+        # Only check events that happened within the visible chart timeframe
+        break_time = next((ts for ev, ts in pool.events if ev == "BREAK" and ts <= chart_end_time), None)
+        swept_in_window = any(ev == "SWEEP" and ts <= chart_end_time for ev, ts in pool.events)
+
+        # 1. Never draw pools that were created in the future (after the right edge of the chart)
+        if pool.creation_time > chart_end_time:
+            continue
+
+        # 2. Skip pools from previous days that sit outside the visible chart's price range
+        if pool.creation_time < chart_start_time:
+            if pool.lower_bound > chart_max_high or pool.upper_bound < chart_min_low:
+                continue
+
+        if break_time is not None:
             color = "rgba(128, 128, 128, 0.3)"
             line_color = "gray"
-        elif pool.has_been_swept:
+            status = "Broken"
+            end_time = break_time - pd.Timedelta(minutes=1)
+        elif swept_in_window:
             color = "rgba(255, 0, 0, 0.3)"
             line_color = "red"
+            status = "Swept"
+            end_time = chart_end_time
         else:
             color = "rgba(0, 255, 0, 0.3)"
             line_color = "green"
+            status = "Active"
+            end_time = chart_end_time
 
         if getattr(pool, 'source', '') == "Macro_Session":
             if getattr(pool, 'session_origin', '') == "Asia":
-                # Gold for Asia Session
                 color = "rgba(255, 215, 0, 0.4)"
                 line_color = "rgba(255, 215, 0, 1.0)"
             elif getattr(pool, 'session_origin', '') == "London":
-                # Deep Sky Blue for London Session
                 color = "rgba(0, 191, 255, 0.4)"
                 line_color = "rgba(0, 191, 255, 1.0)"
             elif getattr(pool, 'session_origin', '') == "New York":
-                # Purple / Orchid for NY Session
                 color = "rgba(218, 112, 214, 0.4)"
                 line_color = "rgba(218, 112, 214, 1.0)"
-
-        end_time = df.index[-1]
-
-        if not pool.is_active:
-            # If the pool is dead, draw it all the way out to the exact BREAK event
-            for event, timestamp in pool.events:
-                if event == "BREAK":
-                    end_time = timestamp - pd.Timedelta(minutes=1)
-                    break
 
         draw_start = max(pool.creation_time, chart_start_time)
 
@@ -92,20 +102,29 @@ def plot_liquidity_chart(df: pd.DataFrame, pools: List[LiquidityPool], swings: L
         str_start = df.index[idx_start].strftime('%Y-%m-%d %H:%M')
         str_end = df.index[idx_end].strftime('%Y-%m-%d %H:%M')
 
-        visual_lower = pool.lower_bound
-        visual_upper = pool.upper_bound
+        # Get the exact touches and bounds of the pool at the end of the visible chart window (no future leaks!)
+        valid_history = [h for h in getattr(pool, 'touch_history', []) if h[0] <= end_time]
+        if valid_history:
+            _, visible_touches, visual_lower, visual_upper = valid_history[-1]
+        else:
+            visible_touches = pool.touches
+            visual_lower = pool.lower_bound
+            visual_upper = pool.upper_bound
 
-        if visual_upper == visual_lower:
-            visual_offset = 1.00
+        if visual_upper - visual_lower > 1.00:
             if pool.pool_type == 'BSL':
-                visual_upper += visual_offset
+                visual_lower = visual_upper - 1.00
             elif pool.pool_type == 'SSL':
+                visual_upper = visual_lower + 1.00
+        elif visual_upper == visual_lower:
+            visual_offset = 0.25
+            if pool.pool_type == 'BSL':
                 visual_lower -= visual_offset
+            elif pool.pool_type == 'SSL':
+                visual_upper += visual_offset
 
         session_name = getattr(pool, 'session_origin', 'Unknown')
-        status = "Active" if pool.is_active else "Broken"
 
-        # Strictly differentiate the title based on the engine source
         if getattr(pool, 'source', '') == "Macro_Session":
             title_text = f"{session_name} Macro {pool.pool_type}"
         else:
@@ -115,7 +134,7 @@ def plot_liquidity_chart(df: pd.DataFrame, pools: List[LiquidityPool], swings: L
             f"<b>{title_text}</b><br>"
             f"Range: {visual_lower:.2f} - {visual_upper:.2f}<br>"
             f"Status: {status}<br>"
-            f"Touches: {pool.touches}<br>"
+            f"Touches: {visible_touches}<br>"
             f"Time: {pool.creation_time.strftime('%Y-%m-%d %H:%M')}"
         )
 
