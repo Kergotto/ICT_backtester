@@ -1,127 +1,164 @@
 from pathlib import Path
-from tests.analytics import print_structure_events
+from domain.fvg import track_fvgs
 from core.data_loader import load_historical_data, resample_timeframe
 from domain.swings import detect_swings
 from domain.structure import detect_structure
 from domain.liquidity import track_liquidity, GapEngine
 from engine.session_engine import extract_session_liquidity
 from visualization.plotter import plot_liquidity_chart
+from domain.smt import detect_smt_divergence
 
-ENABLE_PLOTTING = True  # Set to False when running batch backtests for max speed
+ENABLE_PLOTTING = True
 
 
-def run_pipeline(data_path: Path):
-    print("1. Loading 1-minute historical data...")
-    df_1m = load_historical_data(data_path)
-    df_1m = df_1m[(df_1m['high'] - df_1m['low']) < 40.0]
-
-    print("2. Resampling higher timeframes (15m context)...")
-    df_15m = resample_timeframe(df_1m, '15min')
-
-    print("3. Detecting Swings & Market Structure...")
-    df_swings = detect_swings(df_1m)
-    df_structure = detect_structure(df_1m, df_swings)
-
-    print("4. Extracting Macro Session Liquidity (Asia/London)...")
-    macro_pools = extract_session_liquidity(df_1m)
-
-    # Group macro pools by their injection time to avoid lookahead bias
-    macro_pools_by_time = {}
+def group_macros(macro_pools):
+    grouped = {}
     for pool in macro_pools:
-        injection_time = pool['time']
+        t = pool['time']
+        if t not in grouped:
+            grouped[t] = []
+        grouped[t].append(pool)
+    return grouped
 
-        if injection_time not in macro_pools_by_time:
-            macro_pools_by_time[injection_time] = []
-        macro_pools_by_time[injection_time].append(pool)
 
-    print("5. Running Spatial Hash Liquidity Vault & Gap Engine...")
-    df_final, liq_engine = track_liquidity(df_structure, df_swings, macro_pools_by_time, tolerance_ticks=4)
+def run_pipeline(primary_path: Path, secondary_path: Path):
+    print("1. Loading 1-minute historical data (ES & NQ)...")
+    df_es = load_historical_data(primary_path)
+    df_es = df_es[(df_es['high'] - df_es['low']) < 40.0]
 
-    # Run Gap Engine over the dataset
+    df_nq = load_historical_data(secondary_path)
+    df_nq = df_nq[(df_nq['high'] - df_nq['low']) < 150.0]
+
+    print("2. Detecting Swings & Market Structure...")
+    es_swings = detect_swings(df_es)
+    es_structure = detect_structure(df_es, es_swings)
+
+    nq_swings = detect_swings(df_nq)
+    nq_structure = detect_structure(df_nq, nq_swings)
+
+    print("3. Extracting Macro Session Liquidity...")
+    es_macro_by_time = group_macros(extract_session_liquidity(df_es))
+    nq_macro_by_time = group_macros(extract_session_liquidity(df_nq))
+
+    print("4. Running Spatial Hash Liquidity Vaults (Tolerance=2)...")
+    _, es_liq_engine = track_liquidity(es_structure, es_swings, es_macro_by_time, tolerance_ticks=2)
+    _, nq_liq_engine = track_liquidity(nq_structure, nq_swings, nq_macro_by_time, tolerance_ticks=2)
+
+    # Weekend Gap Engine (ES only to save processing speed, usually sufficient)
     gap_engine = GapEngine()
-    for row in df_1m.itertuples():
-        gap_engine.process_candle(
-            timestamp=row.Index,
-            open_price=row.open,
-            close_price=row.close,
-            high=row.high,
-            low=row.low
-        )
+    for row in df_es.itertuples():
+        gap_engine.process_candle(row.Index, row.open, row.close, row.high, row.low)
 
-    # Collect Active Pools & Unfilled Gaps for strategy processing
-    all_pools = [pool for bucket in liq_engine.vault.values() for pool in bucket]
-    active_pools = liq_engine.get_active_pools()
-    unfilled_gaps = [g for g in gap_engine.active_gaps if not g.is_filled]
+    print("5. Detecting and tracking Fair Value Gaps (FVG)...")
+    es_fvgs = track_fvgs(df_es)
+    nq_fvgs = track_fvgs(df_nq)
 
-    print("\n" + "=" * 50)
-    print("          ENGINE EXECUTION SUMMARY          ")
-    print("=" * 50)
-    print(f"Total Pools Detected : {len(all_pools)}")
-    print(f"Active Pools Stored  : {len(active_pools)}")
-    print(f"Weekend Gaps Tracked : {len(gap_engine.active_gaps)} (Unfilled: {len(unfilled_gaps)})")
-    print("=" * 50 + "\n")
+    print("6. Calculating SMT Divergence...")
+    smt_events = detect_smt_divergence(es_swings, nq_swings, df_es, df_nq, time_window_minutes=15)
+    print(f"--> Found {len(smt_events)} SMT Events.")
+    for smt in smt_events[-5:]:  # Print the last 5 so we don't flood the console
+        print(f"    {smt['description']}")
 
-    print("--- GAP DETAILS ---")
-    for i, gap in enumerate(gap_engine.active_gaps):
-        status = "🟢 FILLED" if gap.is_filled else "🔴 UNFILLED"
-        print(f"Gap {i + 1}: Fri {gap.friday_close_time.strftime('%m-%d %H:%M')} -> "
-              f"Sun {gap.sunday_open_time.strftime('%m-%d %H:%M')} | Status: {status}")
+    es_pools = [pool for bucket in es_liq_engine.vault.values() for pool in bucket]
+    nq_pools = [pool for bucket in nq_liq_engine.vault.values() for pool in bucket]
 
-    return df_1m, df_swings, all_pools, gap_engine
+    return df_es, es_swings, es_pools, es_fvgs, df_nq, nq_swings, nq_pools, nq_fvgs, gap_engine, smt_events
 
 
 def main():
     es_data_path = Path("data/es_1m_sample.csv")
+    nq_data_path = Path("data/nq_1m_sample.csv")
 
-    df_1m, df_swings, all_pools, gap_engine = run_pipeline(es_data_path)
+    df_es, es_swings, es_pools, es_fvgs, df_nq, nq_swings, nq_pools, nq_fvgs, gap_engine, smt_events = run_pipeline(
+        es_data_path, nq_data_path)
 
     if ENABLE_PLOTTING:
-        print("Rendering chart overlay...")
+        print("Rendering chart overlays...")
 
-        macro_pools = [p for p in all_pools if p.source == "Macro_Session"]
+        # 1. Find exact overlap
+        common_index = df_es.index.intersection(df_nq.index)
+        if len(common_index) == 0:
+            print("CRITICAL: ES and NQ datasets have absolutely no overlapping timeframes.")
+            return
 
-        if macro_pools:
-            target_time = macro_pools[0].creation_time
-            print(f"\nCentering plot on Macro Session Pool at: {target_time}")
+        # 2. THE 2-HOUR WINDOW FIX (120 Candles)
+        # Let's center it exactly on the most recent SMT event!
+        if smt_events:
+            target_time = smt_events[-1]['time']
+            print(f"Centering 2-hour window on SMT Event at: {target_time.strftime('%H:%M')}")
+            target_idx = common_index.get_indexer([target_time], method='nearest')[0]
 
-            target_idx = df_1m.index.get_indexer([target_time], method='nearest')[0]
-
-            # Slice 300 candles before and 700 candles after to see the whole day
-            start_idx = max(0, target_idx - 300)
-            end_idx = min(len(df_1m), target_idx + 700)
-            plot_df = df_1m.iloc[start_idx:end_idx]
+            # 60 mins before + 60 mins after = 120 mins (2 hours total)
+            start_idx = max(0, target_idx - 60)
+            end_idx = min(len(common_index) - 1, target_idx + 60)
         else:
-            print("\nNo Macro Session pools found, defaulting to end of dataset.")
-            plot_df = df_1m.iloc[-1000:]
+            # Fallback: Just the last 2 hours of the dataset
+            end_idx = len(common_index) - 1
+            start_idx = max(0, end_idx - 120)
 
-        start_time = plot_df.index[0]
-        end_time = plot_df.index[-1]
+        start_time = common_index[start_idx]
+        end_time = common_index[end_idx]
 
-        # Toggle this to False to hide all the structural noise and ONLY see Macro Highs/Lows
+        # 3. Slice BOTH dataframes safely to this exact 2-hour window
+        plot_df_es = df_es[(df_es.index >= start_time) & (df_es.index <= end_time)]
+        plot_df_nq = df_nq[(df_nq.index >= start_time) & (df_nq.index <= end_time)]
+
         SHOW_STRUCTURAL_POOLS = True
 
-        visible_pools = []
-        for p in all_pools:
-            # Always draw the true Macro Session extremes (Gold, Blue, Purple)
-            if getattr(p, 'source', '') == "Macro_Session":
-                if p.creation_time >= start_time and p.creation_time <= end_time:
-                    visible_pools.append(p)
+        def filter_elements(pools, swings, fvgs, t_start, t_end, min_price, max_price):
+            vis_pools, vis_swings, vis_fvgs = [], [], []
 
-            # Only draw the standard red/green structural pools if the toggle is True
-            elif SHOW_STRUCTURAL_POOLS:
-                if (p.creation_time >= start_time and p.creation_time <= end_time) or \
-                        any(start_time <= t <= end_time for _, t in p.events):
-                    visible_pools.append(p)
+            for p in pools:
+                # Safely get bounds
+                bottom = getattr(p, 'lower_bound', getattr(p, 'bottom', 0))
+                top = getattr(p, 'upper_bound', getattr(p, 'top', 0))
 
-        # Hide the swing markers if structural pools are disabled
-        if SHOW_STRUCTURAL_POOLS:
-            visible_swings = [s for s in df_swings if start_time <= s['time'] <= end_time]
-        else:
-            visible_swings = []
+                # STRICT PRICE CULLING: If it's miles away from the current action, drop it!
+                if top < min_price or bottom > max_price:
+                    continue
 
-        print(f"Drawing {len(visible_pools)} pools and {len(visible_swings)} swings...")
-        plot_liquidity_chart(plot_df, visible_pools, visible_swings)
+                if getattr(p, 'source', '') == "Macro_Session" or SHOW_STRUCTURAL_POOLS:
+                    created_in_window = (t_start <= p.creation_time <= t_end)
+                    active_at_start = (p.creation_time < t_start) and not any(
+                        ev == "BREAK" and ts < t_start for ev, ts in p.events)
+                    if created_in_window or active_at_start:
+                        vis_pools.append(p)
 
+            if SHOW_STRUCTURAL_POOLS:
+                vis_swings = [s for s in swings if t_start <= s['time'] <= t_end]
+
+            for f in fvgs:
+                bottom = getattr(f, 'bottom', 0)
+                top = getattr(f, 'top', 0)
+
+                # STRICT PRICE CULLING for FVGs
+                if top < min_price or bottom > max_price:
+                    continue
+
+                created_in_window = (t_start <= f.creation_time <= t_end)
+                active_at_start = (f.creation_time < t_start) and not any(
+                    ev in ["FILLED_BY_CLOSE", "INVERTED"] and ts < t_start for ev, ts, _ in f.events)
+                if created_in_window or active_at_start:
+                    vis_fvgs.append(f)
+
+            return vis_pools, vis_swings, vis_fvgs
+
+        # Apply the filter with a safe visual padding (50 points for ES, 100 for NQ)
+        es_vis_pools, es_vis_swings, es_vis_fvgs = filter_elements(
+            es_pools, es_swings, es_fvgs, start_time, end_time,
+            plot_df_es['low'].min() - 50, plot_df_es['high'].max() + 50
+        )
+
+        nq_vis_pools, nq_vis_swings, nq_vis_fvgs = filter_elements(
+            nq_pools, nq_swings, nq_fvgs, start_time, end_time,
+            plot_df_nq['low'].min() - 100, plot_df_nq['high'].max() + 100
+        )
+
+        print("Plotting ES Chart...")
+        plot_liquidity_chart(plot_df_es, es_vis_pools, es_vis_swings, fvgs=es_vis_fvgs, title="E-Mini S&P 500 (ES)")
+
+        print("Plotting NQ Chart...")
+        plot_liquidity_chart(plot_df_nq, nq_vis_pools, nq_vis_swings, fvgs=nq_vis_fvgs, title="E-Mini Nasdaq 100 (NQ)")
 
 
 if __name__ == "__main__":

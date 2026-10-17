@@ -2,15 +2,17 @@ import pandas as pd
 import plotly.graph_objects as go
 from typing import List, Dict, Any
 from domain.liquidity import LiquidityPool
+import time
+import os
+import time
+import webbrowser
 
 
 def plot_liquidity_chart(df: pd.DataFrame, pools: List[LiquidityPool], swings: List[Dict[str, Any]],
-                         title: str = "Liquidity Sweep Analysis") -> None:
+                         fvgs: List[Any] = None, title: str = "Liquidity Sweep Analysis") -> None:
     """
-    Renders an interactive candlestick chart with overlaid liquidity pools and swing markers.
+    Renders an interactive candlestick chart with overlaid liquidity pools, swing markers, and FVGs.
     """
-    # 1. Convert the DatetimeIndex to strict strings.
-    # Plotly treats strings as categories, automatically placing them side-by-side with no gaps!
     str_index = df.index.strftime('%Y-%m-%d %H:%M')
 
     fig = go.Figure(data=[go.Candlestick(
@@ -102,7 +104,7 @@ def plot_liquidity_chart(df: pd.DataFrame, pools: List[LiquidityPool], swings: L
         str_start = df.index[idx_start].strftime('%Y-%m-%d %H:%M')
         str_end = df.index[idx_end].strftime('%Y-%m-%d %H:%M')
 
-        # Get the exact touches and bounds of the pool at the end of the visible chart window (no future leaks!)
+        # Get the exact touches and bounds of the pool at the end of the visible chart window
         valid_history = [h for h in getattr(pool, 'touch_history', []) if h[0] <= end_time]
         if valid_history:
             _, visible_touches, visual_lower, visual_upper = valid_history[-1]
@@ -152,6 +154,70 @@ def plot_liquidity_chart(df: pd.DataFrame, pools: List[LiquidityPool], swings: L
             hoverlabel=dict(bgcolor="black", bordercolor=line_color, font_size=12)
         ))
 
+    if fvgs:
+        for fvg in fvgs:
+            if fvg.creation_time > chart_end_time or fvg.creation_time < chart_start_time:
+                continue
+
+            # Reconstruct the visible status and end time based ONLY on events within the chart window
+            end_time = chart_end_time
+            display_status = "Active"
+
+            for ev, ts, _ in fvg.events:
+                if ts <= chart_end_time:
+                    if ev == "INVERTED":
+                        end_time = ts
+                        display_status = "Inverted"
+                        break
+                    elif ev in ["FILLED_BY_CLOSE", "FILLED_BY_WICK"]:
+                        display_status = "Filled"
+                    elif ev == "MITIGATED" and display_status not in ["Filled", "Inverted"]:
+                        display_status = "Partially_Mitigated"
+
+            idx_start = df.index.searchsorted(fvg.creation_time)
+            idx_end = df.index.searchsorted(end_time)
+            idx_start = max(0, min(idx_start, len(df) - 1))
+            idx_end = max(0, min(idx_end, len(df) - 1))
+
+            str_start = df.index[idx_start].strftime('%Y-%m-%d %H:%M')
+            str_end = df.index[idx_end].strftime('%Y-%m-%d %H:%M')
+
+            color = "rgba(0, 150, 255, 0.15)" if fvg.fvg_type == 'BISI' else "rgba(255, 100, 100, 0.15)"
+            line_color = "rgba(0, 150, 255, 0.5)" if fvg.fvg_type == 'BISI' else "rgba(255, 100, 100, 0.5)"
+
+            hover_text = (
+                f"<b>{fvg.fvg_type} FVG</b><br>"
+                f"Range: {fvg.bottom:.2f} - {fvg.top:.2f}<br>"
+                f"CE (50%): {fvg.ce:.2f}<br>"
+                f"Status: {display_status}<br>"
+                f"Time: {fvg.creation_time.strftime('%Y-%m-%d %H:%M')}"
+            )
+
+            # Draw the FVG Box
+            fig.add_trace(go.Scatter(
+                x=[str_start, str_end, str_end, str_start, str_start],
+                y=[fvg.bottom, fvg.bottom, fvg.top, fvg.top, fvg.bottom],
+                fill='toself',
+                fillcolor=color,
+                opacity=0.7,
+                line=dict(color=line_color, width=1, dash='dot'),
+                mode='lines',
+                hoverinfo='text',
+                text=hover_text,
+                showlegend=False,
+                hoverlabel=dict(bgcolor="black", bordercolor=line_color, font_size=12)
+            ))
+
+            # Draw the CE (50%) Dashed Line inside the FVG
+            fig.add_trace(go.Scatter(
+                x=[str_start, str_end],
+                y=[fvg.ce, fvg.ce],
+                mode='lines',
+                line=dict(color=line_color, width=1, dash='dash'),
+                hoverinfo='skip',
+                showlegend=False
+            ))
+
     fig.update_layout(
         title=title,
         yaxis_title="Price",
@@ -162,4 +228,10 @@ def plot_liquidity_chart(df: pd.DataFrame, pools: List[LiquidityPool], swings: L
         height=800
     )
 
-    fig.show()
+    filename = "es_chart.html" if "ES" in title else "nq_chart.html"
+    filepath = os.path.abspath(filename)
+
+    fig.write_html(filepath, auto_open=False)
+
+    webbrowser.open(f"file:///{filepath}")
+    time.sleep(1)
