@@ -1,6 +1,7 @@
 from pathlib import Path
 from domain.fvg import track_fvgs
 from core.data_loader import load_historical_data, resample_timeframe
+from domain.equilibrium import track_dealing_ranges
 from domain.swings import detect_swings
 from domain.structure import detect_structure
 from domain.liquidity import track_liquidity, GapEngine
@@ -29,12 +30,14 @@ def run_pipeline(primary_path: Path, secondary_path: Path):
     df_nq = load_historical_data(secondary_path)
     df_nq = df_nq[(df_nq['high'] - df_nq['low']) < 150.0]
 
-    print("2. Detecting Swings & Market Structure...")
+    print("2. Detecting Swings, Market Structure & Dealing Ranges...")
     es_swings = detect_swings(df_es)
     es_structure = detect_structure(df_es, es_swings)
+    es_ranges = track_dealing_ranges(df_es, es_swings)
 
     nq_swings = detect_swings(df_nq)
     nq_structure = detect_structure(df_nq, nq_swings)
+    nq_ranges = track_dealing_ranges(df_nq, nq_swings)
 
     print("3. Extracting Macro Session Liquidity...")
     es_macro_by_time = group_macros(extract_session_liquidity(df_es))
@@ -62,15 +65,22 @@ def run_pipeline(primary_path: Path, secondary_path: Path):
     es_pools = [pool for bucket in es_liq_engine.vault.values() for pool in bucket]
     nq_pools = [pool for bucket in nq_liq_engine.vault.values() for pool in bucket]
 
-    return df_es, es_swings, es_pools, es_fvgs, df_nq, nq_swings, nq_pools, nq_fvgs, gap_engine, smt_events
+    return (
+        df_es, es_swings, es_pools, es_fvgs, es_ranges,
+        df_nq, nq_swings, nq_pools, nq_fvgs, nq_ranges,
+        gap_engine, smt_events
+    )
 
 
 def main():
     es_data_path = Path("data/es_1m_sample.csv")
     nq_data_path = Path("data/nq_1m_sample.csv")
 
-    df_es, es_swings, es_pools, es_fvgs, df_nq, nq_swings, nq_pools, nq_fvgs, gap_engine, smt_events = run_pipeline(
-        es_data_path, nq_data_path)
+    (
+        df_es, es_swings, es_pools, es_fvgs, es_ranges,
+        df_nq, nq_swings, nq_pools, nq_fvgs, nq_ranges,
+        gap_engine, smt_events
+    ) = run_pipeline(es_data_path, nq_data_path)
 
     if ENABLE_PLOTTING:
         print("Rendering chart overlays...")
@@ -82,17 +92,14 @@ def main():
             return
 
         # 2. THE 2-HOUR WINDOW FIX (120 Candles)
-        # Let's center it exactly on the most recent SMT event!
         if smt_events:
             target_time = smt_events[-1]['time']
             print(f"Centering 2-hour window on SMT Event at: {target_time.strftime('%H:%M')}")
             target_idx = common_index.get_indexer([target_time], method='nearest')[0]
 
-            # 60 mins before + 60 mins after = 120 mins (2 hours total)
             start_idx = max(0, target_idx - 60)
             end_idx = min(len(common_index) - 1, target_idx + 60)
         else:
-            # Fallback: Just the last 2 hours of the dataset
             end_idx = len(common_index) - 1
             start_idx = max(0, end_idx - 120)
 
@@ -105,15 +112,13 @@ def main():
 
         SHOW_STRUCTURAL_POOLS = True
 
-        def filter_elements(pools, swings, fvgs, t_start, t_end, min_price, max_price):
-            vis_pools, vis_swings, vis_fvgs = [], [], []
+        def filter_elements(pools, swings, fvgs, ranges, t_start, t_end, min_price, max_price):
+            vis_pools, vis_swings, vis_fvgs, vis_ranges = [], [], [], []
 
             for p in pools:
-                # Safely get bounds
                 bottom = getattr(p, 'lower_bound', getattr(p, 'bottom', 0))
                 top = getattr(p, 'upper_bound', getattr(p, 'top', 0))
 
-                # STRICT PRICE CULLING: If it's miles away from the current action, drop it!
                 if top < min_price or bottom > max_price:
                     continue
 
@@ -131,7 +136,6 @@ def main():
                 bottom = getattr(f, 'bottom', 0)
                 top = getattr(f, 'top', 0)
 
-                # STRICT PRICE CULLING for FVGs
                 if top < min_price or bottom > max_price:
                     continue
 
@@ -141,24 +145,43 @@ def main():
                 if created_in_window or active_at_start:
                     vis_fvgs.append(f)
 
-            return vis_pools, vis_swings, vis_fvgs
+            for dr in ranges:
+                # Keep only ranges whose bounds fit comfortably inside the chart's price window
+                if dr.high > max_price or dr.low < min_price:
+                    continue
+
+                created_in_window = (t_start <= dr.creation_time <= t_end)
+                active_at_start = (dr.creation_time < t_start) and (
+                    dr.break_time is None or dr.break_time >= t_start
+                )
+
+                if created_in_window or active_at_start:
+                    vis_ranges.append(dr)
+
+            return vis_pools, vis_swings, vis_fvgs, vis_ranges
 
         # Apply the filter with a safe visual padding (50 points for ES, 100 for NQ)
-        es_vis_pools, es_vis_swings, es_vis_fvgs = filter_elements(
-            es_pools, es_swings, es_fvgs, start_time, end_time,
+        es_vis_pools, es_vis_swings, es_vis_fvgs, es_vis_ranges = filter_elements(
+            es_pools, es_swings, es_fvgs, es_ranges, start_time, end_time,
             plot_df_es['low'].min() - 50, plot_df_es['high'].max() + 50
         )
 
-        nq_vis_pools, nq_vis_swings, nq_vis_fvgs = filter_elements(
-            nq_pools, nq_swings, nq_fvgs, start_time, end_time,
+        nq_vis_pools, nq_vis_swings, nq_vis_fvgs, nq_vis_ranges = filter_elements(
+            nq_pools, nq_swings, nq_fvgs, nq_ranges, start_time, end_time,
             plot_df_nq['low'].min() - 100, plot_df_nq['high'].max() + 100
         )
 
-        print("Plotting ES Chart...")
-        plot_liquidity_chart(plot_df_es, es_vis_pools, es_vis_swings, fvgs=es_vis_fvgs, title="E-Mini S&P 500 (ES)")
+        print(f"Plotting ES Chart ({len(es_vis_ranges)} Dealing Ranges in window)...")
+        plot_liquidity_chart(
+            plot_df_es, es_vis_pools, es_vis_swings,
+            fvgs=es_vis_fvgs, ranges=es_vis_ranges, title="E-Mini S&P 500 (ES)"
+        )
 
-        print("Plotting NQ Chart...")
-        plot_liquidity_chart(plot_df_nq, nq_vis_pools, nq_vis_swings, fvgs=nq_vis_fvgs, title="E-Mini Nasdaq 100 (NQ)")
+        print(f"Plotting NQ Chart ({len(nq_vis_ranges)} Dealing Ranges in window)...")
+        plot_liquidity_chart(
+            plot_df_nq, nq_vis_pools, nq_vis_swings,
+            fvgs=nq_vis_fvgs, ranges=nq_vis_ranges, title="E-Mini Nasdaq 100 (NQ)"
+        )
 
 
 if __name__ == "__main__":

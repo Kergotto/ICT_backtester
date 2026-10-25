@@ -1,17 +1,23 @@
-import pandas as pd
-import plotly.graph_objects as go
-from typing import List, Dict, Any
-from domain.liquidity import LiquidityPool
-import time
 import os
 import time
 import webbrowser
+from typing import List, Dict, Any
+import pandas as pd
+import plotly.graph_objects as go
+from domain.liquidity import LiquidityPool
 
 
-def plot_liquidity_chart(df: pd.DataFrame, pools: List[LiquidityPool], swings: List[Dict[str, Any]],
-                         fvgs: List[Any] = None, title: str = "Liquidity Sweep Analysis") -> None:
+def plot_liquidity_chart(
+    df: pd.DataFrame,
+    pools: List[LiquidityPool],
+    swings: List[Dict[str, Any]],
+    fvgs: List[Any] = None,
+    ranges: List[Any] = None,
+    title: str = "Liquidity Sweep Analysis"
+) -> None:
     """
-    Renders an interactive candlestick chart with overlaid liquidity pools, swing markers, and FVGs.
+    Renders an interactive candlestick chart with overlaid liquidity pools,
+    swing markers, FVGs, and Dealing Range Equilibrium (50% EQ) boxes.
     """
     str_index = df.index.strftime('%Y-%m-%d %H:%M')
 
@@ -24,7 +30,6 @@ def plot_liquidity_chart(df: pd.DataFrame, pools: List[LiquidityPool], swings: L
         name="Price Action"
     )])
 
-    # Format swing times to exactly match the string index formatting
     high_times = [s['time'].strftime('%Y-%m-%d %H:%M') for s in swings if
                   s['type'] == 'SwingHigh' and s['time'] in df.index]
     high_prices = [s['price'] for s in swings if s['type'] == 'SwingHigh' and s['time'] in df.index]
@@ -53,15 +58,12 @@ def plot_liquidity_chart(df: pd.DataFrame, pools: List[LiquidityPool], swings: L
     chart_min_low = df['low'].min()
 
     for pool in pools:
-        # Only check events that happened within the visible chart timeframe
         break_time = next((ts for ev, ts in pool.events if ev == "BREAK" and ts <= chart_end_time), None)
         swept_in_window = any(ev == "SWEEP" and ts <= chart_end_time for ev, ts in pool.events)
 
-        # 1. Never draw pools that were created in the future (after the right edge of the chart)
         if pool.creation_time > chart_end_time:
             continue
 
-        # 2. Skip pools from previous days that sit outside the visible chart's price range
         if pool.creation_time < chart_start_time:
             if pool.lower_bound > chart_max_high or pool.upper_bound < chart_min_low:
                 continue
@@ -104,7 +106,6 @@ def plot_liquidity_chart(df: pd.DataFrame, pools: List[LiquidityPool], swings: L
         str_start = df.index[idx_start].strftime('%Y-%m-%d %H:%M')
         str_end = df.index[idx_end].strftime('%Y-%m-%d %H:%M')
 
-        # Get the exact touches and bounds of the pool at the end of the visible chart window
         valid_history = [h for h in getattr(pool, 'touch_history', []) if h[0] <= end_time]
         if valid_history:
             _, visible_touches, visual_lower, visual_upper = valid_history[-1]
@@ -159,7 +160,6 @@ def plot_liquidity_chart(df: pd.DataFrame, pools: List[LiquidityPool], swings: L
             if fvg.creation_time > chart_end_time or fvg.creation_time < chart_start_time:
                 continue
 
-            # Reconstruct the visible status and end time based ONLY on events within the chart window
             end_time = chart_end_time
             display_status = "Active"
 
@@ -193,7 +193,6 @@ def plot_liquidity_chart(df: pd.DataFrame, pools: List[LiquidityPool], swings: L
                 f"Time: {fvg.creation_time.strftime('%Y-%m-%d %H:%M')}"
             )
 
-            # Draw the FVG Box
             fig.add_trace(go.Scatter(
                 x=[str_start, str_end, str_end, str_start, str_start],
                 y=[fvg.bottom, fvg.bottom, fvg.top, fvg.top, fvg.bottom],
@@ -208,7 +207,6 @@ def plot_liquidity_chart(df: pd.DataFrame, pools: List[LiquidityPool], swings: L
                 hoverlabel=dict(bgcolor="black", bordercolor=line_color, font_size=12)
             ))
 
-            # Draw the CE (50%) Dashed Line inside the FVG
             fig.add_trace(go.Scatter(
                 x=[str_start, str_end],
                 y=[fvg.ce, fvg.ce],
@@ -218,11 +216,80 @@ def plot_liquidity_chart(df: pd.DataFrame, pools: List[LiquidityPool], swings: L
                 showlegend=False
             ))
 
+    # Overlay Dealing Ranges (Full Square/Box) & Equilibrium (50% EQ) Levels
+    if ranges:
+        shown_in_legend = False
+        for dr in ranges:
+            if dr.creation_time > chart_end_time:
+                continue
+
+            draw_start = max(dr.creation_time, chart_start_time)
+            if dr.break_time is not None and dr.break_time <= chart_end_time:
+                draw_end = dr.break_time
+                vis_status = "Broken"
+                box_color = "rgba(0, 255, 255, 0.07)"
+                border_color = "rgba(0, 220, 220, 0.75)"
+                eq_color = "rgba(0, 255, 255, 0.85)"
+            else:
+                draw_end = chart_end_time
+                vis_status = "EQ_Mitigated" if (
+                    dr.eq_mitigation_time is not None and dr.eq_mitigation_time <= chart_end_time
+                ) else "Active"
+                box_color = "rgba(0, 255, 255, 0.12)"
+                border_color = "rgba(0, 255, 255, 1.0)"
+                eq_color = "rgba(0, 255, 255, 1.0)"
+
+            idx_start = max(0, min(df.index.searchsorted(draw_start), len(df) - 1))
+            idx_end = max(0, min(df.index.searchsorted(draw_end), len(df) - 1))
+
+            str_start = df.index[idx_start].strftime('%Y-%m-%d %H:%M')
+            str_end = df.index[idx_end].strftime('%Y-%m-%d %H:%M')
+
+            ote_low, ote_high = dr.ote_bounds
+            hover_text = (
+                f"<b>{dr.direction} Dealing Range</b><br>"
+                f"High (Top Border): {dr.high:.2f}<br>"
+                f"Equilibrium (50%): {dr.eq:.2f}<br>"
+                f"Low (Bottom Border): {dr.low:.2f}<br>"
+                f"OTE (62%-79%): {ote_low:.2f} - {ote_high:.2f}<br>"
+                f"Status: {vis_status}<br>"
+                f"Anchor Swing: {dr.start_time.strftime('%Y-%m-%d %H:%M')}<br>"
+                f"Range Created: {dr.creation_time.strftime('%Y-%m-%d %H:%M')}"
+            )
+
+            # 1. Clear Dealing Range Square/Rectangle (Solid 2px Top, Bottom, Left, Right borders)
+            fig.add_trace(go.Scatter(
+                x=[str_start, str_end, str_end, str_start, str_start],
+                y=[dr.low, dr.low, dr.high, dr.high, dr.low],
+                fill='toself',
+                fillcolor=box_color,
+                line=dict(color=border_color, width=2, dash='solid'),
+                mode='lines',
+                hoverinfo='text',
+                text=hover_text,
+                showlegend=False,
+                hoverlabel=dict(bgcolor="black", bordercolor="cyan", font_size=12)
+            ))
+
+            # 2. Prominent 50% Equilibrium (EQ) dash-dot center line
+            fig.add_trace(go.Scatter(
+                x=[str_start, str_end],
+                y=[dr.eq, dr.eq],
+                mode='lines',
+                line=dict(color=eq_color, width=2.5, dash='dashdot'),
+                hoverinfo='text',
+                text=hover_text,
+                name="Dealing Range & EQ (50%)",
+                showlegend=not shown_in_legend,
+                hoverlabel=dict(bgcolor="black", bordercolor="cyan", font_size=12)
+            ))
+            shown_in_legend = True
+
     fig.update_layout(
         title=title,
         yaxis_title="Price",
         xaxis_title="Time (NY)",
-        xaxis_type='category',  # Forces Plotly to place categories side-by-side
+        xaxis_type='category',
         xaxis_rangeslider_visible=False,
         template="plotly_dark",
         height=800

@@ -13,7 +13,7 @@ def create_df(data: list) -> pd.DataFrame:
 
 
 def test_detect_bisi_and_sibi():
-    # 1. Test BISI (Bullish FVG) Detection
+    # Test BISI Bullish FVG Detection
     # Candle 1 High = 100, Candle 3 Low = 105 -> Gap: 100 to 105
     df_bisi = create_df([
         [90, 100, 80, 95],  # C1
@@ -26,7 +26,7 @@ def test_detect_bisi_and_sibi():
     assert fvgs[0].bottom == 100.0
     assert fvgs[0].top == 105.0
 
-    # 2. Test SIBI (Bearish FVG) Detection
+    # Test Bearish FVG Detection
     # Candle 1 Low = 200, Candle 3 High = 195 -> Gap: 195 to 200
     df_sibi = create_df([
         [210, 220, 200, 205],  # C1

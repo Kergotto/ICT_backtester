@@ -73,9 +73,7 @@ def detect_smt_divergence(
     sync_minutes = min(time_window_minutes, 3)
     seen_confirmations = set()
 
-    # ==========================================
-    # 1. BEARISH SMT (BSL Sweep + 1m Bearish MSS)
-    # ==========================================
+    # BEARISH SMT (BSL Sweep + 1m Bearish MSS)
     for i, curr_es in enumerate(es_highs):
         curr_nq = get_closest_swing_fast(curr_es['time'], nq_highs, nq_high_times, max_diff_minutes=sync_minutes)
         if not curr_nq:
@@ -148,7 +146,7 @@ def detect_smt_divergence(
                         disrespected = True
                         break
 
-                # 2. Dynamically get the most recent 1m SwingLow formed before candle `t`
+                # Dynamically get the most recent 1m SwingLow formed before candle `t`
                 es_l_idx = bisect.bisect_left(es_low_times, t) - 1
                 es_mss_level = (
                     es_lows[es_l_idx]['price']
@@ -163,7 +161,7 @@ def detect_smt_divergence(
                     else None
                 )
 
-                # 3. Check for 1m candle body close strictly below the MSS swing low
+                # Check for 1m candle body close strictly below the MSS swing low
                 if has_es_bar and es_mss_level is not None and es_close_arr[es_idx] < es_mss_level:
                     confirm_time = t
                     confirm_asset = "ES"
@@ -205,9 +203,7 @@ def detect_smt_divergence(
                 })
                 break
 
-    # ==========================================
-    # 2. BULLISH SMT (SSL Sweep + 1m Bullish MSS)
-    # ==========================================
+    # BULLISH SMT (SSL Sweep + 1m Bullish MSS)
     for i, curr_es in enumerate(es_lows):
         curr_nq = get_closest_swing_fast(curr_es['time'], nq_lows, nq_low_times, max_diff_minutes=sync_minutes)
         if not curr_nq:
@@ -255,7 +251,6 @@ def detect_smt_divergence(
             if not (es_swept_ssl or nq_swept_ssl):
                 continue
 
-            # Step forward minute-by-minute (up to 20 mins) to check disrespect and dynamic 1m MSS
             confirm_time = None
             confirm_asset = None
             confirm_level = None
@@ -270,7 +265,7 @@ def detect_smt_divergence(
                 nq_idx = nq_times.searchsorted(t) if has_nq_close else -1
                 has_nq_bar = has_nq_close and nq_idx < len(nq_times) and nq_times[nq_idx] == t
 
-                # 1. Check if the holding index disrespected its low (Equal Low or Sweep)
+                # Check if the holding index disrespected its low (Equal Low or Sweep)
                 if es_swept_ssl and has_nq_ohlc and has_nq_bar:
                     if nq_low_arr[nq_idx] <= prev_nq['price']:
                         disrespected = True
@@ -280,7 +275,7 @@ def detect_smt_divergence(
                         disrespected = True
                         break
 
-                # 2. Dynamically get the most recent 1m SwingHigh formed before candle `t`
+                # Dynamically get the most recent 1m SwingHigh formed before candle `t`
                 es_h_idx = bisect.bisect_left(es_high_times, t) - 1
                 es_mss_level = (
                     es_highs[es_h_idx]['price']
@@ -295,7 +290,7 @@ def detect_smt_divergence(
                     else None
                 )
 
-                # 3. Check for 1m candle body close strictly above the MSS swing high
+                # Check for 1m candle body close strictly above the MSS swing high
                 if has_es_bar and es_mss_level is not None and es_close_arr[es_idx] > es_mss_level:
                     confirm_time = t
                     confirm_asset = "ES"
