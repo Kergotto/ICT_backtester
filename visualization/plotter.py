@@ -13,11 +13,12 @@ def plot_liquidity_chart(
     swings: List[Dict[str, Any]],
     fvgs: List[Any] = None,
     ranges: List[Any] = None,
+    fibs: List[Any] = None,
     title: str = "Liquidity Sweep Analysis"
 ) -> None:
     """
     Renders an interactive candlestick chart with overlaid liquidity pools,
-    swing markers, FVGs, and Dealing Range Equilibrium (50% EQ) boxes.
+    swing markers, FVGs, single-leg Equilibrium boxes, and multi-swing Fibonacci OTE zones.
     """
     str_index = df.index.strftime('%Y-%m-%d %H:%M')
 
@@ -216,28 +217,89 @@ def plot_liquidity_chart(
                 showlegend=False
             ))
 
-    # Overlay Dealing Ranges (Full Square/Box) & Equilibrium (50% EQ) Levels
+    # Overlay Single-Leg Equilibrium Boxes (Strictly from Anchor Swing to Next Swing)
     if ranges:
-        shown_in_legend = False
+        shown_eq_legend = False
         for dr in ranges:
-            if dr.creation_time > chart_end_time:
+            if dr.creation_time < chart_start_time or dr.start_time > chart_end_time:
                 continue
 
-            draw_start = max(dr.creation_time, chart_start_time)
+            # Left border = Anchor Swing (dr.start_time), Right border = Completing Swing (dr.creation_time)
+            draw_start = max(dr.start_time, chart_start_time)
+            draw_end = min(dr.creation_time, chart_end_time)
+
+            idx_start = max(0, min(df.index.searchsorted(draw_start), len(df) - 1))
+            idx_end = max(0, min(df.index.searchsorted(draw_end), len(df) - 1))
+            if idx_end <= idx_start and idx_start < len(df) - 1:
+                idx_end = idx_start + 1
+
+            str_start = df.index[idx_start].strftime('%Y-%m-%d %H:%M')
+            str_end = df.index[idx_end].strftime('%Y-%m-%d %H:%M')
+
             if dr.break_time is not None and dr.break_time <= chart_end_time:
-                draw_end = dr.break_time
                 vis_status = "Broken"
-                box_color = "rgba(0, 255, 255, 0.07)"
-                border_color = "rgba(0, 220, 220, 0.75)"
-                eq_color = "rgba(0, 255, 255, 0.85)"
+            elif dr.eq_mitigation_time is not None and dr.eq_mitigation_time <= chart_end_time:
+                vis_status = "EQ_Mitigated"
+            else:
+                vis_status = "Active"
+
+            box_color = "rgba(0, 255, 255, 0.08)"
+            border_color = "rgba(0, 255, 255, 0.85)"
+            eq_color = "rgba(0, 255, 255, 1.0)"
+
+            hover_text = (
+                f"<b>{dr.direction} Equilibrium (Single Leg)</b><br>"
+                f"1.0 High (Top Border): {dr.high:.2f}<br>"
+                f"0.5 Equilibrium (50%): {dr.eq:.2f}<br>"
+                f"0.0 Low (Bottom Border): {dr.low:.2f}<br>"
+                f"Status: {vis_status}<br>"
+                f"Start Swing: {dr.start_time.strftime('%Y-%m-%d %H:%M')}<br>"
+                f"End Swing: {dr.creation_time.strftime('%Y-%m-%d %H:%M')}"
+            )
+
+            # 1. Equilibrium Box (Swing 1 to Swing 2)
+            fig.add_trace(go.Scatter(
+                x=[str_start, str_end, str_end, str_start, str_start],
+                y=[dr.low, dr.low, dr.high, dr.high, dr.low],
+                fill='toself',
+                fillcolor=box_color,
+                line=dict(color=border_color, width=1.5, dash='solid'),
+                mode='lines',
+                hoverinfo='text',
+                text=hover_text,
+                legendgroup="equilibrium",
+                showlegend=False,
+                hoverlabel=dict(bgcolor="black", bordercolor="cyan", font_size=12)
+            ))
+
+            # 2. 0.5 Equilibrium Center Line
+            fig.add_trace(go.Scatter(
+                x=[str_start, str_end],
+                y=[dr.eq, dr.eq],
+                mode='lines',
+                line=dict(color=eq_color, width=2, dash='dashdot'),
+                hoverinfo='text',
+                text=hover_text,
+                name="Dealing Range & EQ (50%)",
+                legendgroup="equilibrium",
+                showlegend=not shown_eq_legend,
+                hoverlabel=dict(bgcolor="black", bordercolor="cyan", font_size=12)
+            ))
+            shown_eq_legend = True
+
+    # Overlay Multi-Swing Fibonacci Retracements & OTE (62% - 70.5% - 79%)
+    if fibs:
+        shown_fib_legend = False
+        for fib in fibs:
+            if fib.extreme_time < chart_start_time or fib.start_time > chart_end_time:
+                continue
+
+            draw_start = max(fib.start_time, chart_start_time)
+            # Extend Fib retracement across the pullback until broken or end of window
+            if fib.break_time is not None and fib.break_time <= chart_end_time:
+                draw_end = fib.break_time
             else:
                 draw_end = chart_end_time
-                vis_status = "EQ_Mitigated" if (
-                    dr.eq_mitigation_time is not None and dr.eq_mitigation_time <= chart_end_time
-                ) else "Active"
-                box_color = "rgba(0, 255, 255, 0.12)"
-                border_color = "rgba(0, 255, 255, 1.0)"
-                eq_color = "rgba(0, 255, 255, 1.0)"
 
             idx_start = max(0, min(df.index.searchsorted(draw_start), len(df) - 1))
             idx_end = max(0, min(df.index.searchsorted(draw_end), len(df) - 1))
@@ -245,45 +307,63 @@ def plot_liquidity_chart(
             str_start = df.index[idx_start].strftime('%Y-%m-%d %H:%M')
             str_end = df.index[idx_end].strftime('%Y-%m-%d %H:%M')
 
-            ote_low, ote_high = dr.ote_bounds
+            lvls = fib.levels
+            ote_low, ote_high = fib.ote_bounds
+
             hover_text = (
-                f"<b>{dr.direction} Dealing Range</b><br>"
-                f"High (Top Border): {dr.high:.2f}<br>"
-                f"Equilibrium (50%): {dr.eq:.2f}<br>"
-                f"Low (Bottom Border): {dr.low:.2f}<br>"
-                f"OTE (62%-79%): {ote_low:.2f} - {ote_high:.2f}<br>"
-                f"Status: {vis_status}<br>"
-                f"Anchor Swing: {dr.start_time.strftime('%Y-%m-%d %H:%M')}<br>"
-                f"Range Created: {dr.creation_time.strftime('%Y-%m-%d %H:%M')}"
+                f"<b>{fib.direction} Fibonacci Retracement ({fib.swing_count} Swings)</b><br>"
+                f"0.0 (Extreme): {lvls[0.0]:.2f}<br>"
+                f"0.382: {lvls[0.382]:.2f}<br>"
+                f"0.500: {lvls[0.5]:.2f}<br>"
+                f"0.620 (OTE): {lvls[0.62]:.2f}<br>"
+                f"0.705 (OTE Sweet Spot): {lvls[0.705]:.2f}<br>"
+                f"0.790 (OTE): {lvls[0.79]:.2f}<br>"
+                f"1.0 (Anchor): {lvls[1.0]:.2f}<br>"
+                f"Status: {fib.status}<br>"
+                f"Trend Start: {fib.start_time.strftime('%Y-%m-%d %H:%M')}<br>"
+                f"Extreme Time: {fib.extreme_time.strftime('%Y-%m-%d %H:%M')}"
             )
 
-            # 1. Clear Dealing Range Square/Rectangle (Solid 2px Top, Bottom, Left, Right borders)
+            # 1. Full Fib Range Outer Frame (0.0 to 1.0)
             fig.add_trace(go.Scatter(
                 x=[str_start, str_end, str_end, str_start, str_start],
-                y=[dr.low, dr.low, dr.high, dr.high, dr.low],
-                fill='toself',
-                fillcolor=box_color,
-                line=dict(color=border_color, width=2, dash='solid'),
+                y=[fib.low, fib.low, fib.high, fib.high, fib.low],
                 mode='lines',
-                hoverinfo='text',
-                text=hover_text,
+                line=dict(color="rgba(255, 215, 0, 0.5)", width=1, dash='dot'),
+                hoverinfo='skip',
+                legendgroup="fibonacci",
                 showlegend=False,
-                hoverlabel=dict(bgcolor="black", bordercolor="cyan", font_size=12)
             ))
 
-            # 2. Prominent 50% Equilibrium (EQ) dash-dot center line
+            # 2. OTE Zone (0.62 - 0.79) Shaded Box
             fig.add_trace(go.Scatter(
-                x=[str_start, str_end],
-                y=[dr.eq, dr.eq],
+                x=[str_start, str_end, str_end, str_start, str_start],
+                y=[ote_low, ote_low, ote_high, ote_high, ote_low],
+                fill='toself',
+                fillcolor="rgba(255, 80, 80, 0.16)",
+                line=dict(color="rgba(255, 90, 90, 0.85)", width=1.5, dash='solid'),
                 mode='lines',
-                line=dict(color=eq_color, width=2.5, dash='dashdot'),
                 hoverinfo='text',
                 text=hover_text,
-                name="Dealing Range & EQ (50%)",
-                showlegend=not shown_in_legend,
-                hoverlabel=dict(bgcolor="black", bordercolor="cyan", font_size=12)
+                legendgroup="fibonacci",
+                showlegend=False,
+                hoverlabel=dict(bgcolor="black", bordercolor="gold", font_size=12)
             ))
-            shown_in_legend = True
+
+            # 3. 0.705 OTE Sweet Spot Line (Green)
+            fig.add_trace(go.Scatter(
+                x=[str_start, str_end],
+                y=[lvls[0.705], lvls[0.705]],
+                mode='lines',
+                line=dict(color="rgba(50, 220, 100, 0.95)", width=2, dash='dash'),
+                hoverinfo='text',
+                text=hover_text,
+                name="Fibonacci & OTE (62%-79%)",
+                legendgroup="fibonacci",
+                showlegend=not shown_fib_legend,
+                hoverlabel=dict(bgcolor="black", bordercolor="gold", font_size=12)
+            ))
+            shown_fib_legend = True
 
     fig.update_layout(
         title=title,

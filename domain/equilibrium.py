@@ -7,8 +7,8 @@ import pandas as pd
 @dataclass
 class DealingRange:
     """
-    Represents an ICT Dealing Range with 50% Equilibrium (EQ),
-    Premium/Discount zones, and Optimal Trade Entry (OTE) bounds.
+    Represents a single-leg ICT Equilibrium range (0, 0.5, 1) strictly from
+    one Swing Low to the immediate next Swing High (or Swing High to Swing Low).
     """
     direction: str  # 'BULLISH' (Low -> High) or 'BEARISH' (High -> Low)
     low: float
@@ -23,41 +23,21 @@ class DealingRange:
 
     @property
     def eq(self) -> float:
-        """Exact 50% Equilibrium price level."""
+        """Exact 0.5 (50%) Equilibrium price level."""
         return (self.high + self.low) / 2.0
 
     @property
     def range_size(self) -> float:
-        """Total point size of the dealing range."""
+        """Total point size of the single-leg dealing range."""
         return self.high - self.low
-
-    @property
-    def ote_bounds(self) -> Tuple[float, float]:
-        """
-        Returns the (lower_bound, upper_bound) of the 62% - 79% retracement
-        Optimal Trade Entry (OTE) zone based on range direction.
-        """
-        if self.direction == "BULLISH":
-            ote_top = self.high - 0.62 * self.range_size
-            ote_bottom = self.high - 0.79 * self.range_size
-            return (ote_bottom, ote_top)
-        else:
-            ote_bottom = self.low + 0.62 * self.range_size
-            ote_top = self.low + 0.79 * self.range_size
-            return (ote_bottom, ote_top)
 
     def get_zone(self, price: float) -> str:
         """
-        Classifies a given price as 'PREMIUM', 'DISCOUNT', or 'EQUILIBRIUM'.
+        Classifies a given price as 'PREMIUM' (> 0.5), 'DISCOUNT' (< 0.5), or 'EQUILIBRIUM'.
         """
         if np.isclose(price, self.eq, atol=1e-5):
             return "EQUILIBRIUM"
         return "PREMIUM" if price > self.eq else "DISCOUNT"
-
-    def is_in_ote(self, price: float) -> bool:
-        """Checks if a price sits inside the 62% - 79% OTE zone."""
-        lower, upper = self.ote_bounds
-        return lower <= price <= upper
 
     def get_position_pct(self, price: float) -> float:
         """
@@ -69,13 +49,36 @@ class DealingRange:
         return (price - self.low) / self.range_size
 
 
+def _build_alternating_swings(swings: List[Dict]) -> List[Dict]:
+    """
+    Collapses consecutive same-type swings to their most extreme pivot
+    so every adjacent pair forms a valid (SwingLow <-> SwingHigh) leg.
+    """
+    if not swings:
+        return []
+
+    alt: List[Dict] = [swings[0]]
+    for s in swings[1:]:
+        prev = alt[-1]
+        if s["type"] != prev["type"]:
+            alt.append(s)
+        else:
+            if s["type"] == "SwingHigh" and s["price"] >= prev["price"]:
+                alt[-1] = s
+            elif s["type"] == "SwingLow" and s["price"] <= prev["price"]:
+                alt[-1] = s
+    return alt
+
+
 def track_dealing_ranges(df: pd.DataFrame, swings: List[Dict]) -> List[DealingRange]:
     """
-    Constructs and tracks External Dealing Ranges from swing points and OHLC data.
-    Internal swings inside an active range are ignored until the range is broken.
+    Constructs and tracks single-leg Dealing Ranges (Equilibrium 0 - 0.5 - 1)
+    on EVERY SwingLow -> SwingHigh and SwingHigh -> SwingLow leg, including
+    internal legs that form inside larger ranges.
     """
     ranges: List[DealingRange] = []
-    if len(swings) < 2:
+    alt_swings = _build_alternating_swings(swings)
+    if len(alt_swings) < 2:
         return ranges
 
     has_ohlc = (
@@ -88,109 +91,39 @@ def track_dealing_ranges(df: pd.DataFrame, swings: List[Dict]) -> List[DealingRa
         low_arr = df["low"].to_numpy()
         close_arr = df["close"].to_numpy()
 
-    # 1. Establish the initial dealing range from the first opposing swing pair
-    first_s = swings[0]
-    init_idx = None
-    for idx in range(1, len(swings)):
-        if swings[idx]["type"] != first_s["type"]:
-            init_idx = idx
-            break
+    # 1. Spawn an Equilibrium range on every adjacent High/Low or Low/High leg
+    for i in range(1, len(alt_swings)):
+        prev_s = alt_swings[i - 1]
+        s = alt_swings[i]
 
-    if init_idx is None:
-        return ranges
+        if prev_s["type"] == "SwingLow" and s["type"] == "SwingHigh":
+            if s["price"] > prev_s["price"]:
+                ranges.append(
+                    DealingRange(
+                        direction="BULLISH",
+                        low=prev_s["price"],
+                        high=s["price"],
+                        start_time=prev_s["time"],
+                        creation_time=s["time"],
+                    )
+                )
+        elif prev_s["type"] == "SwingHigh" and s["type"] == "SwingLow":
+            if prev_s["price"] > s["price"]:
+                ranges.append(
+                    DealingRange(
+                        direction="BEARISH",
+                        low=s["price"],
+                        high=prev_s["price"],
+                        start_time=prev_s["time"],
+                        creation_time=s["time"],
+                    )
+                )
 
-    second_s = swings[init_idx]
-    if first_s["type"] == "SwingLow" and second_s["type"] == "SwingHigh":
-        if second_s["price"] > first_s["price"]:
-            current_range = DealingRange(
-                direction="BULLISH",
-                low=first_s["price"],
-                high=second_s["price"],
-                start_time=first_s["time"],
-                creation_time=second_s["time"],
-            )
-            ranges.append(current_range)
-        else:
-            current_range = None
-    else:
-        if first_s["price"] > second_s["price"]:
-            current_range = DealingRange(
-                direction="BEARISH",
-                low=second_s["price"],
-                high=first_s["price"],
-                start_time=first_s["time"],
-                creation_time=second_s["time"],
-            )
-            ranges.append(current_range)
-        else:
-            current_range = None
-
-    # 2. Iterate through subsequent swings to detect external range expansions
-    for i in range(init_idx + 1, len(swings)):
-        s = swings[i]
-
-        if current_range is None:
-            prev_s = swings[i - 1]
-            if prev_s["type"] == "SwingLow" and s["type"] == "SwingHigh" and s["price"] > prev_s["price"]:
-                current_range = DealingRange("BULLISH", prev_s["price"], s["price"], prev_s["time"], s["time"])
-                ranges.append(current_range)
-            elif prev_s["type"] == "SwingHigh" and s["type"] == "SwingLow" and prev_s["price"] > s["price"]:
-                current_range = DealingRange("BEARISH", s["price"], prev_s["price"], prev_s["time"], s["time"])
-                ranges.append(current_range)
-            continue
-
-        # Bullish expansion above current range high
-        if s["type"] == "SwingHigh" and s["price"] > current_range.high:
-            # If continuing Bullish, search lows after the previous high (creation_time);
-            # If reversing from Bearish, include the Bearish low at creation_time.
-            search_start = current_range.creation_time
-            intervening_lows = [
-                sw for sw in swings[:i]
-                if sw["type"] == "SwingLow" and sw["time"] >= search_start
-            ]
-            anchor_low = min(intervening_lows, key=lambda x: x["price"]) if intervening_lows else {
-                "price": current_range.low,
-                "time": current_range.start_time,
-            }
-
-            current_range = DealingRange(
-                direction="BULLISH",
-                low=anchor_low["price"],
-                high=s["price"],
-                start_time=anchor_low["time"],
-                creation_time=s["time"],
-            )
-            ranges.append(current_range)
-
-        # Bearish expansion below current range low
-        elif s["type"] == "SwingLow" and s["price"] < current_range.low:
-            # If continuing Bearish, search highs after the previous low (creation_time);
-            # If reversing from Bullish, include the Bullish high at creation_time.
-            search_start = current_range.creation_time
-            intervening_highs = [
-                sw for sw in swings[:i]
-                if sw["type"] == "SwingHigh" and sw["time"] >= search_start
-            ]
-            anchor_high = max(intervening_highs, key=lambda x: x["price"]) if intervening_highs else {
-                "price": current_range.high,
-                "time": current_range.start_time,
-            }
-
-            current_range = DealingRange(
-                direction="BEARISH",
-                low=s["price"],
-                high=anchor_high["price"],
-                start_time=anchor_high["time"],
-                creation_time=s["time"],
-            )
-            ranges.append(current_range)
-
-    # 3. Track EQ mitigation and range breaks using OHLC candle data
+    # 2. Track 50% Equilibrium mitigation and range breaks on OHLC candles
     if has_ohlc:
-        for idx, dr in enumerate(ranges):
+        for dr in ranges:
             start_pos = times.searchsorted(dr.creation_time, side="right")
-            next_creation = ranges[idx + 1].creation_time if idx + 1 < len(ranges) else None
-            end_pos = times.searchsorted(next_creation, side="right") if next_creation is not None else len(times)
+            end_pos = len(times)
 
             for pos in range(start_pos, end_pos):
                 t = times[pos]
@@ -198,7 +131,7 @@ def track_dealing_ranges(df: pd.DataFrame, swings: List[Dict]) -> List[DealingRa
                 c_low = low_arr[pos]
                 c_close = close_arr[pos]
 
-                # Check Equilibrium (50%) mitigation first
+                # Check Equilibrium (0.5) mitigation first
                 if not dr.eq_mitigated:
                     if dr.direction == "BULLISH" and c_low <= dr.eq:
                         dr.eq_mitigated = True
@@ -217,12 +150,6 @@ def track_dealing_ranges(df: pd.DataFrame, swings: List[Dict]) -> List[DealingRa
                     dr.break_time = t
                     dr.events.append(("BREAK", t))
                     break
-
-            # If superseded by a new range via wick expansion before a body close break
-            if dr.break_time is None and next_creation is not None:
-                dr.status = "BROKEN"
-                dr.break_time = next_creation
-                dr.events.append(("BREAK", next_creation))
 
     return ranges
 
