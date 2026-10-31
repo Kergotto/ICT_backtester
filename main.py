@@ -46,7 +46,7 @@ def run_pipeline(primary_path: Path, secondary_path: Path):
     es_macro_by_time = group_macros(extract_session_liquidity(df_es))
     nq_macro_by_time = group_macros(extract_session_liquidity(df_nq))
 
-    print("4. Running Spatial Hash Liquidity Vaults (Tolerance=2)...")
+    print("4. Running Spatial-Indexed Liquidity Engine (Tolerance=2)...")
     _, es_liq_engine = track_liquidity(es_structure, es_swings, es_macro_by_time, tolerance_ticks=2)
     _, nq_liq_engine = track_liquidity(nq_structure, nq_swings, nq_macro_by_time, tolerance_ticks=2)
 
@@ -65,8 +65,8 @@ def run_pipeline(primary_path: Path, secondary_path: Path):
     for smt in smt_events[-5:]:
         print(f"    {smt['description']}")
 
-    es_pools = [pool for bucket in es_liq_engine.vault.values() for pool in bucket]
-    nq_pools = [pool for bucket in nq_liq_engine.vault.values() for pool in bucket]
+    es_pools = es_liq_engine.get_all_pools()
+    nq_pools = nq_liq_engine.get_all_pools()
 
     return (
         df_es, es_swings, es_pools, es_fvgs, es_ranges, es_fibs,

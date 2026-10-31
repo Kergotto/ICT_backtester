@@ -174,22 +174,30 @@ class SessionManager:
 
 
 class LiquidityEngine:
+    """
+    Spatial-bucketed liquidity index that maintains only active pools in its
+    hash buckets (self.vault) by pruning broken pools into self.archived_pools.
+    """
+
     def __init__(self, tolerance_ticks: int = 4, bucket_size: float = 100.0):
         self.tolerance = TickTolerance(ticks=tolerance_ticks)
         self.bucket_size = bucket_size
         self.vault: Dict[int, List[LiquidityPool]] = {}
+        self.archived_pools: List[LiquidityPool] = []
 
     def _get_bucket_key(self, price: float) -> int:
         return int(price // self.bucket_size) * int(self.bucket_size)
 
     def add_new_swing(self, pool_type: str, price: float, timestamp: pd.Timestamp):
         bucket_key = self._get_bucket_key(price)
-        buckets_to_check = [bucket_key - int(self.bucket_size), bucket_key, bucket_key + int(self.bucket_size)]
+        step = int(self.bucket_size)
+        buckets_to_check = [bucket_key - step, bucket_key, bucket_key + step]
 
         for b_key in buckets_to_check:
-            if b_key not in self.vault: continue
+            if b_key not in self.vault:
+                continue
             for pool in self.vault[b_key]:
-                # Skip broken pools AND already-swept pools so new swings (like 11:22) can form their own pools!
+                # Skip already-swept pools so subsequent swings can form their own pools
                 if not pool.is_active or pool.has_been_swept or pool.pool_type != pool_type:
                     continue
 
@@ -230,36 +238,35 @@ class LiquidityEngine:
             creation_time=timestamp,
             session_origin=SessionManager.get_session(timestamp)
         )
-        if bucket_key not in self.vault: self.vault[bucket_key] = []
+        if bucket_key not in self.vault:
+            self.vault[bucket_key] = []
         self.vault[bucket_key].append(new_pool)
 
     def clean_duplicate_pools(self):
-        global_macros = []
-        for pools in self.vault.values():
-            global_macros.extend([p for p in pools if getattr(p, 'source', '') == "Macro_Session"])
+        all_pools = self.get_all_pools()
+        global_macros = [p for p in all_pools if getattr(p, 'source', '') == "Macro_Session"]
 
         if not global_macros:
             return
 
-        for bucket_key, pools in self.vault.items():
-            cleaned_pools = []
-            for p in pools:
-                if getattr(p, 'source', '') == "Macro_Session":
-                    cleaned_pools.append(p)
-                    continue
+        def _is_duplicate(p: LiquidityPool) -> bool:
+            if getattr(p, 'source', '') == "Macro_Session":
+                return False
+            for mp in global_macros:
+                if p.pool_type == mp.pool_type and abs((p.creation_time - mp.creation_time).total_seconds()) <= 43200:
+                    mp_price = mp.upper_bound if mp.pool_type == 'BSL' else mp.lower_bound
+                    if abs(p.initial_price - mp_price) <= 1.0:
+                        return True
+            return False
 
-                is_duplicate = False
-                for mp in global_macros:
-                    if p.pool_type == mp.pool_type and abs((p.creation_time - mp.creation_time).total_seconds()) <= 43200:
-                        mp_price = mp.upper_bound if mp.pool_type == 'BSL' else mp.lower_bound
-                        if abs(p.initial_price - mp_price) <= 1.0:
-                            is_duplicate = True
-                            break
+        for bucket_key in list(self.vault.keys()):
+            cleaned = [p for p in self.vault[bucket_key] if not _is_duplicate(p)]
+            if cleaned:
+                self.vault[bucket_key] = cleaned
+            else:
+                del self.vault[bucket_key]
 
-                if not is_duplicate:
-                    cleaned_pools.append(p)
-
-            self.vault[bucket_key] = cleaned_pools
+        self.archived_pools = [p for p in self.archived_pools if not _is_duplicate(p)]
 
     def inject_macro_session_pool(self, pool_type: str, price: float, timestamp: pd.Timestamp, session_name: str):
         bucket_key = self._get_bucket_key(price)
@@ -281,21 +288,37 @@ class LiquidityEngine:
     def check_for_sweeps_and_breaks(self, high: float, low: float, close: float, timestamp: pd.Timestamp):
         start_bucket = self._get_bucket_key(low)
         end_bucket = self._get_bucket_key(high)
-        keys_to_check = range(start_bucket, end_bucket + int(self.bucket_size), int(self.bucket_size))
+        step = int(self.bucket_size)
+        keys_to_check = range(start_bucket, end_bucket + step, step)
+
         for key in keys_to_check:
-            if key not in self.vault: continue
+            if key not in self.vault:
+                continue
+
+            active_in_bucket: List[LiquidityPool] = []
             for pool in self.vault[key]:
                 if pool.is_active:
                     pool.evaluate_candle(high, low, close, timestamp)
 
-    def get_active_pools(self) -> List[LiquidityPool]:
-        """Returns a flat list of all currently active pools across the vault."""
-        active_pools = []
-        for bucket in self.vault.values():
-            for pool in bucket:
+                # Keep only unbroken pools in the active spatial bucket;
+                # prune broken pools into archived_pools immediately.
                 if pool.is_active:
-                    active_pools.append(pool)
-        return active_pools
+                    active_in_bucket.append(pool)
+                else:
+                    self.archived_pools.append(pool)
+
+            if active_in_bucket:
+                self.vault[key] = active_in_bucket
+            else:
+                del self.vault[key]
+
+    def get_active_pools(self) -> List[LiquidityPool]:
+        """Returns a flat list of all currently active pools across the spatial index."""
+        return [pool for bucket in self.vault.values() for pool in bucket]
+
+    def get_all_pools(self) -> List[LiquidityPool]:
+        """Returns both active and archived (broken) pools for visualization and reporting."""
+        return self.get_active_pools() + self.archived_pools
 
 
 def track_liquidity(df_structure: pd.DataFrame, swings: List[Dict[str, Any]],
@@ -307,7 +330,8 @@ def track_liquidity(df_structure: pd.DataFrame, swings: List[Dict[str, Any]],
 
     swings_by_time = {}
     for s in swings:
-        if s['time'] not in swings_by_time: swings_by_time[s['time']] = []
+        if s['time'] not in swings_by_time:
+            swings_by_time[s['time']] = []
         swings_by_time[s['time']].append(s)
 
     highs = df['high'].values
