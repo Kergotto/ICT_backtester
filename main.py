@@ -12,6 +12,12 @@ from domain.smt import detect_smt_divergence
 
 ENABLE_PLOTTING = True
 
+CHART_TIMEFRAME = "15min"
+
+# If True (and CHART_TIMEFRAME == "1min"), overlays HTF_OVERLAY_TF confluences onto the 1m chart
+OVERLAY_HTF_ON_1M = False
+HTF_OVERLAY_TF = "15min"
+
 
 def group_macros(macro_pools):
     grouped = {}
@@ -23,15 +29,31 @@ def group_macros(macro_pools):
     return grouped
 
 
-def run_pipeline(primary_path: Path, secondary_path: Path):
+def run_pipeline(primary_path: Path, secondary_path: Path, timeframe: str = "1min"):
     print("1. Loading 1-minute historical data (ES & NQ)...")
-    df_es = load_historical_data(primary_path)
-    df_es = df_es[(df_es['high'] - df_es['low']) < 40.0]
+    df_es_1m = load_historical_data(primary_path)
+    df_es_1m = df_es_1m[(df_es_1m['high'] - df_es_1m['low']) < 40.0]
 
-    df_nq = load_historical_data(secondary_path)
-    df_nq = df_nq[(df_nq['high'] - df_nq['low']) < 150.0]
+    df_nq_1m = load_historical_data(secondary_path)
+    df_nq_1m = df_nq_1m[(df_nq_1m['high'] - df_nq_1m['low']) < 150.0]
 
-    print("2. Detecting Swings, Market Structure, Equilibrium & Fibonacci Ranges...")
+    # Macro session liquidity is always extracted from 1m data for exact session boundaries
+    print("2. Extracting Macro Session Liquidity...")
+    es_macro_by_time = group_macros(extract_session_liquidity(df_es_1m))
+    nq_macro_by_time = group_macros(extract_session_liquidity(df_nq_1m))
+
+    # Resample if Higher Timeframe is selected
+    if timeframe != "1min":
+        print(f"   Resampling 1m data to Higher Timeframe ({timeframe})...")
+        df_es = resample_timeframe(df_es_1m, timeframe)
+        df_nq = resample_timeframe(df_nq_1m, timeframe)
+        smt_window = 60  # Wider SMT alignment window for HTF swings
+    else:
+        df_es = df_es_1m
+        df_nq = df_nq_1m
+        smt_window = 15
+
+    print(f"3. Detecting {timeframe} Swings, Structure, Equilibrium & Fibonacci Ranges...")
     es_swings = detect_swings(df_es)
     es_structure = detect_structure(df_es, es_swings)
     es_ranges = track_dealing_ranges(df_es, es_swings)
@@ -42,31 +64,44 @@ def run_pipeline(primary_path: Path, secondary_path: Path):
     nq_ranges = track_dealing_ranges(df_nq, nq_swings)
     nq_fibs = track_fibonacci_ranges(df_nq, nq_swings)
 
-    print("3. Extracting Macro Session Liquidity...")
-    es_macro_by_time = group_macros(extract_session_liquidity(df_es))
-    nq_macro_by_time = group_macros(extract_session_liquidity(df_nq))
-
-    print("4. Running Spatial-Indexed Liquidity Engine (Tolerance=2)...")
+    print(f"4. Running Spatial-Indexed Liquidity Engine on {timeframe} (Tolerance=2)...")
     _, es_liq_engine = track_liquidity(es_structure, es_swings, es_macro_by_time, tolerance_ticks=2)
     _, nq_liq_engine = track_liquidity(nq_structure, nq_swings, nq_macro_by_time, tolerance_ticks=2)
 
-    # Weekend Gap Engine (ES only to save processing speed, usually sufficient)
     gap_engine = GapEngine()
     for row in df_es.itertuples():
         gap_engine.process_candle(row.Index, row.open, row.close, row.high, row.low)
 
-    print("5. Detecting and tracking Fair Value Gaps (FVG)...")
+    print(f"5. Detecting and tracking {timeframe} Fair Value Gaps (FVG)...")
     es_fvgs = track_fvgs(df_es)
     nq_fvgs = track_fvgs(df_nq)
 
-    print("6. Calculating SMT Divergence...")
-    smt_events = detect_smt_divergence(es_swings, nq_swings, df_es, df_nq, time_window_minutes=15)
-    print(f"--> Found {len(smt_events)} SMT Events.")
+    print(f"6. Calculating {timeframe} SMT Divergence...")
+    smt_events = detect_smt_divergence(es_swings, nq_swings, df_es, df_nq, time_window_minutes=smt_window)
+    print(f"--> Found {len(smt_events)} SMT Events on {timeframe}.")
     for smt in smt_events[-5:]:
         print(f"    {smt['description']}")
 
     es_pools = es_liq_engine.get_all_pools()
     nq_pools = nq_liq_engine.get_all_pools()
+
+    # Optional: Compute HTF confluences to overlay onto the 1-minute chart
+    if timeframe == "1min" and OVERLAY_HTF_ON_1M:
+        print(f"7. Computing {HTF_OVERLAY_TF} HTF Confluences to overlay on 1m chart...")
+        df_es_htf = resample_timeframe(df_es_1m, HTF_OVERLAY_TF)
+        df_nq_htf = resample_timeframe(df_nq_1m, HTF_OVERLAY_TF)
+
+        es_htf_swings = detect_swings(df_es_htf)
+        nq_htf_swings = detect_swings(df_nq_htf)
+
+        es_ranges = track_dealing_ranges(df_es_htf, es_htf_swings)
+        nq_ranges = track_dealing_ranges(df_nq_htf, nq_htf_swings)
+
+        es_fibs = track_fibonacci_ranges(df_es_htf, es_htf_swings)
+        nq_fibs = track_fibonacci_ranges(df_nq_htf, nq_htf_swings)
+
+        es_fvgs = track_fvgs(df_es_htf)
+        nq_fvgs = track_fvgs(df_nq_htf)
 
     return (
         df_es, es_swings, es_pools, es_fvgs, es_ranges, es_fibs,
@@ -83,19 +118,20 @@ def main():
         df_es, es_swings, es_pools, es_fvgs, es_ranges, es_fibs,
         df_nq, nq_swings, nq_pools, nq_fvgs, nq_ranges, nq_fibs,
         gap_engine, smt_events
-    ) = run_pipeline(es_data_path, nq_data_path)
+    ) = run_pipeline(es_data_path, nq_data_path, timeframe=CHART_TIMEFRAME)
 
     if ENABLE_PLOTTING:
-        print("Rendering chart overlays...")
+        print(f"Rendering {CHART_TIMEFRAME} chart overlays...")
 
         common_index = df_es.index.intersection(df_nq.index)
         if len(common_index) == 0:
             print("CRITICAL: ES and NQ datasets have absolutely no overlapping timeframes.")
             return
 
+        # Center a 120-candle window around the most recent SMT event (or last 120 bars)
         if smt_events:
             target_time = smt_events[-1]['time']
-            print(f"Centering 2-hour window on SMT Event at: {target_time.strftime('%H:%M')}")
+            print(f"Centering 120-bar ({CHART_TIMEFRAME}) window on SMT Event at: {target_time.strftime('%Y-%m-%d %H:%M')}")
             target_idx = common_index.get_indexer([target_time], method='nearest')[0]
 
             start_idx = max(0, target_idx - 60)
@@ -154,33 +190,38 @@ def main():
             for fib in fibs:
                 if fib.high > max_price or fib.low < min_price:
                     continue
-                # Show multi-swing Fib ranges (swing_count >= 2) or significant trend legs in window
                 in_window = (fib.extreme_time >= t_start and fib.start_time <= t_end)
                 if in_window and fib.swing_count >= 2:
                     vis_fibs.append(fib)
 
             return vis_pools, vis_swings, vis_fvgs, vis_ranges, vis_fibs
 
+        # Scale vertical price padding automatically based on the visible price range
+        es_span = max(50.0, (plot_df_es['high'].max() - plot_df_es['low'].min()) * 0.5)
+        nq_span = max(100.0, (plot_df_nq['high'].max() - plot_df_nq['low'].min()) * 0.5)
+
         es_vis_pools, es_vis_swings, es_vis_fvgs, es_vis_ranges, es_vis_fibs = filter_elements(
             es_pools, es_swings, es_fvgs, es_ranges, es_fibs, start_time, end_time,
-            plot_df_es['low'].min() - 50, plot_df_es['high'].max() + 50
+            plot_df_es['low'].min() - es_span, plot_df_es['high'].max() + es_span
         )
 
         nq_vis_pools, nq_vis_swings, nq_vis_fvgs, nq_vis_ranges, nq_vis_fibs = filter_elements(
             nq_pools, nq_swings, nq_fvgs, nq_ranges, nq_fibs, start_time, end_time,
-            plot_df_nq['low'].min() - 100, plot_df_nq['high'].max() + 100
+            plot_df_nq['low'].min() - nq_span, plot_df_nq['high'].max() + nq_span
         )
 
-        print(f"Plotting ES Chart ({len(es_vis_ranges)} Equilibriums, {len(es_vis_fibs)} Fib Ranges)...")
+        print(f"Plotting ES {CHART_TIMEFRAME} Chart ({len(es_vis_ranges)} Equilibriums, {len(es_vis_fibs)} Fib Ranges)...")
         plot_liquidity_chart(
             plot_df_es, es_vis_pools, es_vis_swings,
-            fvgs=es_vis_fvgs, ranges=es_vis_ranges, fibs=es_vis_fibs, title="E-Mini S&P 500 (ES)"
+            fvgs=[], ranges=[], fibs=[],
+            title=f"E-Mini S&P 500 (ES) - {CHART_TIMEFRAME}"
         )
 
-        print(f"Plotting NQ Chart ({len(nq_vis_ranges)} Equilibriums, {len(nq_vis_fibs)} Fib Ranges)...")
+        print(f"Plotting NQ {CHART_TIMEFRAME} Chart ({len(nq_vis_ranges)} Equilibriums, {len(nq_vis_fibs)} Fib Ranges)...")
         plot_liquidity_chart(
             plot_df_nq, nq_vis_pools, nq_vis_swings,
-            fvgs=nq_vis_fvgs, ranges=nq_vis_ranges, fibs=nq_vis_fibs, title="E-Mini Nasdaq 100 (NQ)"
+            fvgs=[], ranges=[], fibs=[],
+            title=f"E-Mini Nasdaq 100 (NQ) - {CHART_TIMEFRAME}"
         )
 
 

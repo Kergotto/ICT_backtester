@@ -321,42 +321,60 @@ class LiquidityEngine:
         return self.get_active_pools() + self.archived_pools
 
 
-def track_liquidity(df_structure: pd.DataFrame, swings: List[Dict[str, Any]],
-                    macro_pools_by_time: Dict[pd.Timestamp, List[Dict]], tolerance_ticks: int = 4) -> tuple[
-    pd.DataFrame, LiquidityEngine]:
+def track_liquidity(
+    df_structure: pd.DataFrame,
+    swings: List[Dict[str, Any]],
+    macro_pools_by_time: Dict[pd.Timestamp, List[Dict]],
+    tolerance_ticks: int = 4,
+) -> tuple[pd.DataFrame, LiquidityEngine]:
     df = df_structure.copy()
     times = df.index
     engine = LiquidityEngine(tolerance_ticks=tolerance_ticks)
 
-    swings_by_time = {}
-    for s in swings:
-        if s['time'] not in swings_by_time:
-            swings_by_time[s['time']] = []
-        swings_by_time[s['time']].append(s)
+    # Sort swings chronologically
+    sorted_swings = sorted(swings, key=lambda x: x["time"])
+    swing_idx = 0
+    num_swings = len(sorted_swings)
 
-    highs = df['high'].values
-    lows = df['low'].values
-    closes = df['close'].values
+    # Flatten and sort all macro session pools chronologically so they inject
+    # cleanly on ANY resampled timeframe (1m, 5m, 15m, 1h, 4h)
+    flat_macros: List[Dict[str, Any]] = []
+    for ts in sorted(macro_pools_by_time.keys()):
+        for m_pool in macro_pools_by_time[ts]:
+            flat_macros.append(m_pool)
+    macro_idx = 0
+    num_macros = len(flat_macros)
 
-    for i in range(1, len(df)):
+    highs = df["high"].values
+    lows = df["low"].values
+    closes = df["close"].values
+
+    for i in range(len(df)):
         current_time = times[i]
 
-        if current_time in swings_by_time:
-            for swing in swings_by_time[current_time]:
-                if swing['type'] == 'SwingHigh':
-                    engine.add_new_swing('BSL', swing['price'], current_time)
-                elif swing['type'] == 'SwingLow':
-                    engine.add_new_swing('SSL', swing['price'], current_time)
+        # 1. Inject any swings that occurred up to `current_time`
+        while swing_idx < num_swings and sorted_swings[swing_idx]["time"] <= current_time:
+            swing = sorted_swings[swing_idx]
+            if swing["type"] == "SwingHigh":
+                engine.add_new_swing("BSL", swing["price"], current_time)
+            elif swing["type"] == "SwingLow":
+                engine.add_new_swing("SSL", swing["price"], current_time)
+            swing_idx += 1
 
-        if current_time in macro_pools_by_time:
-            for m_pool in macro_pools_by_time[current_time]:
-                engine.inject_macro_session_pool(
-                    pool_type=m_pool['type'],
-                    price=m_pool['price'],
-                    timestamp=m_pool['time'],
-                    session_name=m_pool['session']
-                )
-        engine.check_for_sweeps_and_breaks(highs[i], lows[i], closes[i], current_time)
+        # 2. Inject any Macro Session pools that occurred up to `current_time`
+        while macro_idx < num_macros and flat_macros[macro_idx]["time"] <= current_time:
+            m_pool = flat_macros[macro_idx]
+            engine.inject_macro_session_pool(
+                pool_type=m_pool["type"],
+                price=m_pool["price"],
+                timestamp=current_time,
+                session_name=m_pool["session"],
+            )
+            macro_idx += 1
+
+        # 3. Evaluate sweeps and breaks on the current candle
+        if i >= 1:
+            engine.check_for_sweeps_and_breaks(highs[i], lows[i], closes[i], current_time)
 
     engine.clean_duplicate_pools()
 

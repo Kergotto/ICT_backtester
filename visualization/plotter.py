@@ -128,11 +128,16 @@ def plot_liquidity_chart(
                 visual_upper += visual_offset
 
         session_name = getattr(pool, 'session_origin', 'Unknown')
+        is_macro = getattr(pool, 'source', '') == "Macro_Session"
 
-        if getattr(pool, 'source', '') == "Macro_Session":
+        if is_macro:
             title_text = f"{session_name} Macro {pool.pool_type}"
+            border_width = 2.0
+            trace_opacity = 0.75
         else:
             title_text = f"Structural {pool.pool_type} (in {session_name})"
+            border_width = 1.0
+            trace_opacity = 0.6
 
         hover_text = (
             f"<b>{title_text}</b><br>"
@@ -147,8 +152,8 @@ def plot_liquidity_chart(
             y=[visual_lower, visual_lower, visual_upper, visual_upper, visual_lower],
             fill='toself',
             fillcolor=color,
-            opacity=0.6,
-            line=dict(color=line_color, width=1),
+            opacity=trace_opacity,
+            line=dict(color=line_color, width=border_width),
             mode='lines',
             hoverinfo='text',
             text=hover_text,
