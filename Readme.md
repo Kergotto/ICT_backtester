@@ -21,7 +21,7 @@ This project follows an 8-month academic development lifecycle aligned with bach
 - [x] Build Fair Value Gap (FVG) and SMT Divergence engines.
 - [x] Implement Single-Leg Equilibrium (0 - 0.5 - 1) and Multi-Swing Fibonacci Retracement & OTE (0.62 - 0.705 - 0.79) tracking.
 - [x] Output domain markers visually using Plotly to verify visual chart alignment.
-- [ ] Build localized `broker.py` and `portfolio.py` execution modules with step-by-step event loops preventing look-ahead bias.
+- [x] Build localized `broker.py` and `portfolio.py` execution modules with step-by-step event loops preventing look-ahead bias.
 
 ### Stage 2: Performance Metrics & Baseline Models (Months 3–4)
 - [ ] Integrate quantitative performance metrics (Total return, Sharpe ratio, Maximum drawdown, Win rate, Profit factor).
