@@ -9,7 +9,7 @@ from domain.liquidity import track_liquidity, LiquidityPool
 from domain.fvg import track_fvgs, FairValueGap
 from domain.equilibrium import track_dealing_ranges, DealingRange
 from domain.fibonacci import track_fibonacci_ranges, FibonacciRange
-from domain.smt import detect_smt_divergence
+from domain.smt import detect_smt_divergence, is_smt_active_at
 from engine.session_engine import extract_session_liquidity
 from engine.portfolio import Portfolio, TradeRecord
 from engine.broker import SimulatedBroker
@@ -306,7 +306,7 @@ class BacktestEngine:
 
                 vis_smt = [
                     smt for smt in smt_events
-                    if confirmed_cutoff - recent_window <= smt["time"] <= confirmed_cutoff
+                    if is_smt_active_at(smt, t)
                 ]
                 vis_swings = [s for s in swings if s["time"] <= confirmed_cutoff]
             else:

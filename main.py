@@ -77,7 +77,16 @@ def run_pipeline(primary_path: Path, secondary_path: Path, timeframe: str = "1mi
     nq_fvgs = track_fvgs(df_nq)
 
     print(f"6. Calculating {timeframe} SMT Divergence...")
-    smt_events = detect_smt_divergence(es_swings, nq_swings, df_es, df_nq, time_window_minutes=smt_window)
+    smt_events = detect_smt_divergence(
+        es_swings,
+        nq_swings,
+        df_es,
+        df_nq,
+        time_window_minutes=smt_window,
+        timeframe=timeframe,
+        df_es_1m=df_es_1m,
+        df_nq_1m=df_nq_1m,
+    )
     print(f"--> Found {len(smt_events)} SMT Events on {timeframe}.")
     for smt in smt_events[-5:]:
         print(f"    {smt['description']}")
