@@ -41,35 +41,75 @@ def test_random_entry_baseline_reproducibility():
     res2 = engine.run(df, strategy=strat2, precompute_domain=False)
 
     assert res1.total_trades >= 1
-    # Same seed must produce identical trade count and net profit
     assert res1.total_trades == res2.total_trades
     assert np.isclose(res1.net_profit, res2.net_profit)
 
 
 def test_ict_multi_tf_strategy_executes_on_ssl_sweep_and_fvg():
     """
-    Constructs a 12-candle NY session scenario where:
-    1. A SwingLow forms at 5000.0 (SSL pool).
-    2. Price sweeps below 5000.0 down to 4998.5 and displaces up, creating a BISI FVG.
-    3. ICTMultiTimeframeStrategy detects the confirmed SSL sweep + BISI FVG and enters LONG.
+    Constructs a 13-candle NY session scenario (09:30 - 09:42) where:
+    1. A 5-bar SwingLow forms at 09:32 at 5000.0 (SSL pool) and SwingHigh at 09:34 at 5016.0.
+    2. At 09:36, price sweeps below 5000.0 down to 4998.5 and displaces up, creating a BISI FVG [5006 - 5008].
+    3. At 09:39, price dips into the BISI FVG (low = 5007.0) and at 09:40 closes at 5018.0 (> 5016.0 SwingHigh),
+       triggering a 1m Bullish CHoCH inside the 09:40-10:30 NY window.
     """
-    times = pd.date_range("2026-10-16 09:30:00", periods=12, freq="1min", tz="America/New_York")
+    times = pd.date_range("2026-10-16 09:30:00", periods=13, freq="1min", tz="America/New_York")
     data = {
-        "open":  [5010, 5005, 5002, 5008, 5012, 5015, 5010, 4999, 5004, 5008, 5015, 5022],
-        "high":  [5012, 5008, 5009, 5014, 5018, 5017, 5012, 5005, 5012, 5016, 5025, 5028],
-        "low":   [5004, 5000, 5001, 5006, 5010, 5009, 4998.5, 4999, 5003, 5007, 5014, 5020],
-        "close": [5005, 5002, 5008, 5012, 5016, 5010, 5001, 5004, 5010, 5015, 5024, 5026],
-        "volume": [500] * 12,
+        "open":  [5012, 5007, 5004, 5002, 5009, 5015, 5006, 5001, 5011, 5014, 5012, 5018, 5024],
+        "high":  [5014, 5009, 5006, 5010, 5016, 5011, 5006, 5012, 5015, 5014, 5020, 5026, 5035],
+        "low":   [5006, 5003, 5000, 5004, 5008, 5005, 4998.5, 5001, 5008, 5007, 5011, 5017, 5023],
+        "close": [5007, 5004, 5002, 5009, 5015, 5006, 5001, 5011, 5014, 5012, 5018, 5024, 5032],
+        "volume": [500] * 13,
     }
     df = pd.DataFrame(data, index=times)
 
     engine = BacktestEngine(symbol="ES", initial_capital=100_000.0, commission_per_contract=2.0, slippage_ticks=0)
-    strategy = ICTMultiTimeframeStrategy(stop_loss_points=8.0, reward_risk_ratio=2.0)
+    strategy = ICTMultiTimeframeStrategy(stop_loss_points=12.0, reward_risk_ratio=2.0, min_grade="A")
 
     result = engine.run(df, strategy=strategy, precompute_domain=True)
 
     assert result.total_trades >= 1
     first_trade = result.trades[0]
     assert first_trade.direction == "LONG"
+    assert first_trade.entry_time == pd.Timestamp("2026-10-16 09:40:00", tz="America/New_York")
     assert first_trade.metadata.get("ssl_swept") is True
     assert first_trade.metadata.get("bisi_fvg_count", 0) >= 1
+    assert first_trade.metadata.get("grade") in ("A", "A/A+", "A+")
+
+
+def test_setup_grader_assigns_a_plus_vs_b_grade():
+    """
+    Verifies that ICTMultiTimeframeStrategy.grade_setup accurately scores
+    an A+ setup vs. a low-confluence Grade B setup.
+    """
+    # 1. A+ Setup: Tier-1 London High Target + 5m FVG & EQ + Confirmed SMT + Aligned HTFs + Low Liq Taken
+    grade_aplus, score_aplus, pros, _ = ICTMultiTimeframeStrategy.grade_setup(
+        direction="LONG",
+        target_info={"target_type": "SESSION_LONDON", "tier": 1, "rr": 2.4},
+        retracement_type="FVG_AND_EQ",
+        retracement_pts=3,
+        has_smt=True,
+        has_macro_sweep=True,
+        has_structural_sweep=True,
+        htf_trends={"4h": "BULLISH", "1h": "BULLISH", "15min": "BULLISH"},
+        liquidity_taken_level="LOW",
+    )
+    assert grade_aplus == "A+"
+    assert score_aplus >= 9
+    assert len(pros) >= 4
+
+    # 2. Grade B Setup: Tier-2 15m target + 1m counter-BOS only + Counter-HTF + High Liq already taken
+    grade_b, score_b, _, cons = ICTMultiTimeframeStrategy.grade_setup(
+        direction="LONG",
+        target_info={"target_type": "15MIN_POOL", "tier": 2, "rr": 1.3},
+        retracement_type="1M_COUNTER_BOS_ONLY",
+        retracement_pts=1,
+        has_smt=False,
+        has_macro_sweep=False,
+        has_structural_sweep=True,
+        htf_trends={"4h": "BEARISH", "1h": "BEARISH", "15min": "BEARISH"},
+        liquidity_taken_level="HIGH",
+    )
+    assert grade_b == "B"
+    assert score_b <= 4
+    assert len(cons) >= 3

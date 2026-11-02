@@ -1,20 +1,29 @@
 from pathlib import Path
-from domain.fvg import track_fvgs
+from typing import List, Optional
 from core.data_loader import load_historical_data, resample_timeframe
 from domain.equilibrium import track_dealing_ranges
 from domain.fibonacci import track_fibonacci_ranges
-from domain.swings import detect_swings
-from domain.structure import detect_structure
+from domain.fvg import track_fvgs
 from domain.liquidity import track_liquidity, GapEngine
-from engine.session_engine import extract_session_liquidity
-from visualization.plotter import plot_liquidity_chart
 from domain.smt import detect_smt_divergence
+from domain.structure import detect_structure
+from domain.swings import detect_swings
+from engine.event_bus import BacktestEngine, BacktestResult
+from engine.session_engine import extract_session_liquidity
+from strategies.base import BuyAndHoldStrategy, RandomEntryStrategy
+from strategies.ict_multi_tf import ICTMultiTimeframeStrategy
+from visualization.plotter import plot_liquidity_chart
 
-ENABLE_PLOTTING = True
+# --- EXECUTION MODES ---
+RUN_BACKTEST_AUDIT = True
+ENABLE_PLOTTING = False
 
+# Focus dates for TradingView inspection (matches Trades #74 and #75 in your journal)
+# Set to None to print detailed cards for ALL dates in the sample
+FOCUS_AUDIT_DATES: Optional[List[str]] = ["2026-10-13", "2026-10-14", "2026-10-16"]
+
+# --- HTF CHART VERIFICATION SETTINGS (Used when ENABLE_PLOTTING = True) ---
 CHART_TIMEFRAME = "15min"
-
-# If True (and CHART_TIMEFRAME == "1min"), overlays HTF_OVERLAY_TF confluences onto the 1m chart
 OVERLAY_HTF_ON_1M = False
 HTF_OVERLAY_TF = "15min"
 
@@ -29,6 +38,177 @@ def group_macros(macro_pools):
     return grouped
 
 
+def print_comparative_table(results: List[BacktestResult]) -> None:
+    print("\n" + "=" * 105)
+    print(f"{'STRATEGY NAME':<34} | {'SYM':<3} | {'TRADES':>6} | {'WIN %':>6} | {'NET PnL ($)':>12} | {'PF':>5} | {'SHARPE':>6} | {'MAX DD %':>8} | {'AVG R':>6}")
+    print("-" * 105)
+    for r in results:
+        pf_str = f"{r.profit_factor:.2f}" if r.profit_factor != float("inf") else "  INF"
+        print(
+            f"{r.strategy_name:<34} | {r.symbol:<3} | {r.total_trades:>6} | "
+            f"{r.win_rate:>5.1f}% | {r.net_profit:>+12.2f} | {pf_str:>5} | "
+            f"{r.sharpe_ratio:>6.2f} | {r.max_drawdown_pct:>7.2f}% | {r.avg_r_multiple:>+5.2f}R"
+        )
+    print("=" * 105)
+
+
+def print_tradingview_audit(
+    symbol: str,
+    result: BacktestResult,
+    strategy: ICTMultiTimeframeStrategy,
+    focus_dates: Optional[List[str]] = None,
+) -> None:
+    print(f"\n{'#' * 105}")
+    print(f"📋 TRADINGVIEW TRADE-BY-TRADE AUDIT LOG — {symbol} ({result.strategy_name})")
+    print(f"{'#' * 105}")
+
+    trades = result.trades
+    if focus_dates:
+        focused_trades = [t for t in trades if t.entry_time.strftime("%Y-%m-%d") in focus_dates]
+        print(f"Total Trades in Sample: {len(trades)} | Trades on Focus Dates {focus_dates}: {len(focused_trades)}")
+        display_trades = focused_trades if focused_trades else trades
+    else:
+        display_trades = trades
+
+    if not display_trades:
+        print("   No trades executed in this window.")
+    else:
+        for idx, tr in enumerate(display_trades, start=1):
+            meta = tr.metadata or {}
+            htf = meta.get("htf_trends", {})
+            htf_str = (
+                f"4H={htf.get('4h', '?')}, 1H={htf.get('1h', '?')}, "
+                f"15m={htf.get('15min', '?')}, 5m={htf.get('5min', '?')}, 1m={htf.get('1min', '?')}"
+            )
+            print(
+                f"\n  [Trade #{idx}] {symbol} {tr.direction} | Grade: {meta.get('grade', '?')} (Score: {meta.get('score', '?')}/10)"
+            )
+            print(
+                f"    • Entry Time (NY) : {tr.entry_time.strftime('%Y-%m-%d %H:%M')}  --> Check this 1m bar on TradingView"
+            )
+            print(
+                f"    • Exit Time (NY)  : {tr.exit_time.strftime('%Y-%m-%d %H:%M')}  ({tr.exit_reason})"
+            )
+            print(
+                f"    • Prices          : Entry = {tr.entry_price:.2f} | SL = {tr.stop_loss:.2f} | TP = {tr.take_profit:.2f} | Exit = {tr.exit_price:.2f}"
+            )
+            print(
+                f"    • Risk / Reward   : Planned RR = {meta.get('planned_rr', 0.0):.2f}R | Realized = {tr.r_multiple:+.2f}R | Net PnL = ${tr.net_pnl:+.2f} (Qty: {tr.quantity})"
+            )
+            print(
+                f"    • Target (DOL)    : {meta.get('target_type', '?')} (Tier {meta.get('target_tier', '?')})"
+            )
+            print(
+                f"    • 1m Entry Trigger: {meta.get('entry_trigger_detail', '?')}"
+            )
+            print(
+                f"    • Retracement     : {meta.get('retracement_type', '?')} -> {meta.get('retracement_detail', '?')}"
+            )
+            print(
+                f"    • Market Context  : {htf_str} (Locked at Entry)"
+            )
+            taken_list = meta.get("session_taken_pools", [])
+            taken_str = ", ".join(taken_list) if taken_list else "None taken since 09:30 NY open"
+            print(
+                f"    • Liq Exhaustion  : {meta.get('liquidity_already_taken', '?')} ({taken_str})"
+            )
+            if meta.get("swept_pools_detail"):
+                print(f"    • Swept Liquidity : {'; '.join(meta['swept_pools_detail'])}")
+            if meta.get("smt_detail"):
+                print(f"    • Active SMT      : {'; '.join(meta['smt_detail'])}")
+            if meta.get("pros"):
+                print(f"    • Pros (+)        : {'; '.join(meta['pros'])}")
+            if meta.get("cons"):
+                print(f"    • Cons (-)        : {'; '.join(meta['cons'])}")
+
+    if strategy.skipped_setups:
+        print(f"\n  🚫 SKIPPED LOWER-GRADE SETUPS ({len(strategy.skipped_setups)} filtered out by min_grade='{strategy.min_grade}'):")
+        for sk in strategy.skipped_setups[:10]:
+            ts_str = sk["timestamp"].strftime("%Y-%m-%d %H:%M")
+            print(
+                f"    - [{ts_str}] {symbol} {sk['direction']} @ {sk['price']:.2f} | "
+                f"Grade={sk.get('grade')} (Score={sk.get('score')}) | "
+                f"Trigger={sk.get('entry_trigger_detail')} | "
+                f"Target={sk.get('target_type')} | Cons: {', '.join(sk.get('cons', []))}"
+            )
+
+
+def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
+    print("1. Loading 1-minute historical data (ES & NQ)...")
+    df_es_1m = load_historical_data(es_path)
+    df_es_1m = df_es_1m[(df_es_1m["high"] - df_es_1m["low"]) < 40.0]
+
+    df_nq_1m = load_historical_data(nq_path)
+    df_nq_1m = df_nq_1m[(df_nq_1m["high"] - df_nq_1m["low"]) < 150.0]
+
+    print(
+        f"   ES Range: {df_es_1m.index[0]} -> {df_es_1m.index[-1]} ({len(df_es_1m)} bars)\n"
+        f"   NQ Range: {df_nq_1m.index[0]} -> {df_nq_1m.index[-1]} ({len(df_nq_1m)} bars)"
+    )
+
+    all_results: List[BacktestResult] = []
+
+    for sym, df_prim, df_sec, default_sl in (
+        ("ES", df_es_1m, df_nq_1m, 8.0),
+        ("NQ", df_nq_1m, df_es_1m, 35.0),
+    ):
+        print(f"\n2. Running Backtest Suite for {sym}...")
+        engine = BacktestEngine(
+            symbol=sym,
+            initial_capital=100_000.0,
+            commission_per_contract=2.00,
+            slippage_ticks=1,
+        )
+
+        # Baseline 1: Buy and Hold
+        bh_strat = BuyAndHoldStrategy(quantity=1)
+        bh_res = engine.run(df_prim, strategy=bh_strat, precompute_domain=False)
+        all_results.append(bh_res)
+
+        # Baseline 2: Random Entry with matching SL/TP risk geometry
+        rnd_strat = RandomEntryStrategy(
+            stop_loss_points=default_sl,
+            take_profit_points=default_sl * 2.0,
+            entry_probability=0.005,
+            quantity=1,
+            seed=42,
+        )
+        rnd_res = engine.run(df_prim, strategy=rnd_strat, precompute_domain=False)
+        all_results.append(rnd_res)
+
+        # Strategy Variant A: ICT Strategy allowing Grade B setups (Unfiltered)
+        ict_all_grades = ICTMultiTimeframeStrategy(
+            stop_loss_points=default_sl,
+            reward_risk_ratio=2.0,
+            min_rr=1.15,
+            risk_per_trade_pct=0.01,
+            use_dynamic_sizing=True,
+            sl_mode="tight_1m",
+            min_grade="B",
+        )
+        ict_all_grades.name = "ICT_Strategy (Allow Grade B)"
+        res_b = engine.run(df_prim, strategy=ict_all_grades, df_secondary=df_sec, precompute_domain=True)
+        all_results.append(res_b)
+
+        # Strategy Variant B: ICT Strategy strictly filtering for Grade A / A+ only
+        ict_grade_a = ICTMultiTimeframeStrategy(
+            stop_loss_points=default_sl,
+            reward_risk_ratio=2.0,
+            min_rr=1.15,
+            risk_per_trade_pct=0.01,
+            use_dynamic_sizing=True,
+            sl_mode="tight_1m",
+            min_grade="A",
+        )
+        ict_grade_a.name = "ICT_Strategy (Grade A/A+ Only)"
+        res_a = engine.run(df_prim, strategy=ict_grade_a, df_secondary=df_sec, precompute_domain=True)
+        all_results.append(res_a)
+
+        print_tradingview_audit(sym, res_a, ict_grade_a, focus_dates=FOCUS_AUDIT_DATES)
+
+    print_comparative_table(all_results)
+
+
 def run_pipeline(primary_path: Path, secondary_path: Path, timeframe: str = "1min"):
     print("1. Loading 1-minute historical data (ES & NQ)...")
     df_es_1m = load_historical_data(primary_path)
@@ -37,17 +217,15 @@ def run_pipeline(primary_path: Path, secondary_path: Path, timeframe: str = "1mi
     df_nq_1m = load_historical_data(secondary_path)
     df_nq_1m = df_nq_1m[(df_nq_1m['high'] - df_nq_1m['low']) < 150.0]
 
-    # Macro session liquidity is always extracted from 1m data for exact session boundaries
     print("2. Extracting Macro Session Liquidity...")
     es_macro_by_time = group_macros(extract_session_liquidity(df_es_1m))
     nq_macro_by_time = group_macros(extract_session_liquidity(df_nq_1m))
 
-    # Resample if Higher Timeframe is selected
     if timeframe != "1min":
         print(f"   Resampling 1m data to Higher Timeframe ({timeframe})...")
         df_es = resample_timeframe(df_es_1m, timeframe)
         df_nq = resample_timeframe(df_nq_1m, timeframe)
-        smt_window = 60  # Wider SMT alignment window for HTF swings
+        smt_window = 60
     else:
         df_es = df_es_1m
         df_nq = df_nq_1m
@@ -94,7 +272,6 @@ def run_pipeline(primary_path: Path, secondary_path: Path, timeframe: str = "1mi
     es_pools = es_liq_engine.get_all_pools()
     nq_pools = nq_liq_engine.get_all_pools()
 
-    # Optional: Compute HTF confluences to overlay onto the 1-minute chart
     if timeframe == "1min" and OVERLAY_HTF_ON_1M:
         print(f"7. Computing {HTF_OVERLAY_TF} HTF Confluences to overlay on 1m chart...")
         df_es_htf = resample_timeframe(df_es_1m, HTF_OVERLAY_TF)
@@ -123,26 +300,25 @@ def main():
     es_data_path = Path("data/es_1m_sample.csv")
     nq_data_path = Path("data/nq_1m_sample.csv")
 
-    (
-        df_es, es_swings, es_pools, es_fvgs, es_ranges, es_fibs,
-        df_nq, nq_swings, nq_pools, nq_fvgs, nq_ranges, nq_fibs,
-        gap_engine, smt_events
-    ) = run_pipeline(es_data_path, nq_data_path, timeframe=CHART_TIMEFRAME)
+    if RUN_BACKTEST_AUDIT:
+        run_backtest_suite(es_data_path, nq_data_path)
 
     if ENABLE_PLOTTING:
-        print(f"Rendering {CHART_TIMEFRAME} chart overlays...")
+        (
+            df_es, es_swings, es_pools, es_fvgs, es_ranges, es_fibs,
+            df_nq, nq_swings, nq_pools, nq_fvgs, nq_ranges, nq_fibs,
+            gap_engine, smt_events
+        ) = run_pipeline(es_data_path, nq_data_path, timeframe=CHART_TIMEFRAME)
 
+        print(f"Rendering {CHART_TIMEFRAME} chart overlays...")
         common_index = df_es.index.intersection(df_nq.index)
         if len(common_index) == 0:
             print("CRITICAL: ES and NQ datasets have absolutely no overlapping timeframes.")
             return
 
-        # Center a 120-candle window around the most recent SMT event (or last 120 bars)
         if smt_events:
             target_time = smt_events[-1]['time']
-            print(f"Centering 120-bar ({CHART_TIMEFRAME}) window on SMT Event at: {target_time.strftime('%Y-%m-%d %H:%M')}")
             target_idx = common_index.get_indexer([target_time], method='nearest')[0]
-
             start_idx = max(0, target_idx - 60)
             end_idx = min(len(common_index) - 1, target_idx + 60)
         else:
@@ -155,80 +331,13 @@ def main():
         plot_df_es = df_es[(df_es.index >= start_time) & (df_es.index <= end_time)]
         plot_df_nq = df_nq[(df_nq.index >= start_time) & (df_nq.index <= end_time)]
 
-        SHOW_STRUCTURAL_POOLS = True
-
-        def filter_elements(pools, swings, fvgs, ranges, fibs, t_start, t_end, min_price, max_price):
-            vis_pools, vis_swings, vis_fvgs, vis_ranges, vis_fibs = [], [], [], [], []
-
-            for p in pools:
-                bottom = getattr(p, 'lower_bound', getattr(p, 'bottom', 0))
-                top = getattr(p, 'upper_bound', getattr(p, 'top', 0))
-
-                if top < min_price or bottom > max_price:
-                    continue
-
-                if getattr(p, 'source', '') == "Macro_Session" or SHOW_STRUCTURAL_POOLS:
-                    created_in_window = (t_start <= p.creation_time <= t_end)
-                    active_at_start = (p.creation_time < t_start) and not any(
-                        ev == "BREAK" and ts < t_start for ev, ts in p.events)
-                    if created_in_window or active_at_start:
-                        vis_pools.append(p)
-
-            if SHOW_STRUCTURAL_POOLS:
-                vis_swings = [s for s in swings if t_start <= s['time'] <= t_end]
-
-            for f in fvgs:
-                bottom = getattr(f, 'bottom', 0)
-                top = getattr(f, 'top', 0)
-
-                if top < min_price or bottom > max_price:
-                    continue
-
-                created_in_window = (t_start <= f.creation_time <= t_end)
-                active_at_start = (f.creation_time < t_start) and not any(
-                    ev in ["FILLED_BY_CLOSE", "INVERTED"] and ts < t_start for ev, ts, _ in f.events)
-                if created_in_window or active_at_start:
-                    vis_fvgs.append(f)
-
-            for dr in ranges:
-                if dr.high > max_price or dr.low < min_price:
-                    continue
-                if dr.creation_time >= t_start and dr.start_time <= t_end:
-                    vis_ranges.append(dr)
-
-            for fib in fibs:
-                if fib.high > max_price or fib.low < min_price:
-                    continue
-                in_window = (fib.extreme_time >= t_start and fib.start_time <= t_end)
-                if in_window and fib.swing_count >= 2:
-                    vis_fibs.append(fib)
-
-            return vis_pools, vis_swings, vis_fvgs, vis_ranges, vis_fibs
-
-        # Scale vertical price padding automatically based on the visible price range
-        es_span = max(50.0, (plot_df_es['high'].max() - plot_df_es['low'].min()) * 0.5)
-        nq_span = max(100.0, (plot_df_nq['high'].max() - plot_df_nq['low'].min()) * 0.5)
-
-        es_vis_pools, es_vis_swings, es_vis_fvgs, es_vis_ranges, es_vis_fibs = filter_elements(
-            es_pools, es_swings, es_fvgs, es_ranges, es_fibs, start_time, end_time,
-            plot_df_es['low'].min() - es_span, plot_df_es['high'].max() + es_span
-        )
-
-        nq_vis_pools, nq_vis_swings, nq_vis_fvgs, nq_vis_ranges, nq_vis_fibs = filter_elements(
-            nq_pools, nq_swings, nq_fvgs, nq_ranges, nq_fibs, start_time, end_time,
-            plot_df_nq['low'].min() - nq_span, plot_df_nq['high'].max() + nq_span
-        )
-
-        print(f"Plotting ES {CHART_TIMEFRAME} Chart ({len(es_vis_ranges)} Equilibriums, {len(es_vis_fibs)} Fib Ranges)...")
         plot_liquidity_chart(
-            plot_df_es, es_vis_pools, es_vis_swings,
+            plot_df_es, es_pools, es_swings,
             fvgs=[], ranges=[], fibs=[],
             title=f"E-Mini S&P 500 (ES) - {CHART_TIMEFRAME}"
         )
-
-        print(f"Plotting NQ {CHART_TIMEFRAME} Chart ({len(nq_vis_ranges)} Equilibriums, {len(nq_vis_fibs)} Fib Ranges)...")
         plot_liquidity_chart(
-            plot_df_nq, nq_vis_pools, nq_vis_swings,
+            plot_df_nq, nq_pools, nq_swings,
             fvgs=[], ranges=[], fibs=[],
             title=f"E-Mini Nasdaq 100 (NQ) - {CHART_TIMEFRAME}"
         )
