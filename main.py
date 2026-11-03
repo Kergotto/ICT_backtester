@@ -132,7 +132,6 @@ def print_tradingview_audit(
                 f"Target={sk.get('target_type')} | Cons: {', '.join(sk.get('cons', []))}"
             )
 
-
 def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
     print("1. Loading 1-minute historical data (ES & NQ)...")
     df_es_1m = load_historical_data(es_path)
@@ -147,10 +146,12 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
     )
 
     all_results: List[BacktestResult] = []
+    shared_dates_all_grades = {}
+    shared_dates_grade_a = {}
 
     for sym, df_prim, df_sec, default_sl in (
-        ("ES", df_es_1m, df_nq_1m, 8.0),
-        ("NQ", df_nq_1m, df_es_1m, 35.0),
+        ("ES", df_es_1m, df_nq_1m, 5.5),
+        ("NQ", df_nq_1m, df_es_1m, 22.0),
     ):
         print(f"\n2. Running Backtest Suite for {sym}...")
         engine = BacktestEngine(
@@ -180,11 +181,12 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
         ict_all_grades = ICTMultiTimeframeStrategy(
             stop_loss_points=default_sl,
             reward_risk_ratio=2.0,
-            min_rr=1.15,
+            min_rr=1.25,
             risk_per_trade_pct=0.01,
             use_dynamic_sizing=True,
             sl_mode="tight_1m",
             min_grade="B",
+            shared_daily_trade_dates=shared_dates_all_grades,
         )
         ict_all_grades.name = "ICT_Strategy (Allow Grade B)"
         res_b = engine.run(df_prim, strategy=ict_all_grades, df_secondary=df_sec, precompute_domain=True)
@@ -194,11 +196,12 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
         ict_grade_a = ICTMultiTimeframeStrategy(
             stop_loss_points=default_sl,
             reward_risk_ratio=2.0,
-            min_rr=1.15,
+            min_rr=1.25,
             risk_per_trade_pct=0.01,
             use_dynamic_sizing=True,
             sl_mode="tight_1m",
             min_grade="A",
+            shared_daily_trade_dates=shared_dates_grade_a,
         )
         ict_grade_a.name = "ICT_Strategy (Grade A/A+ Only)"
         res_a = engine.run(df_prim, strategy=ict_grade_a, df_secondary=df_sec, precompute_domain=True)

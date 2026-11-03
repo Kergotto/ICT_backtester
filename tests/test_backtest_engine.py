@@ -113,3 +113,41 @@ def test_setup_grader_assigns_a_plus_vs_b_grade():
     assert grade_b == "B"
     assert score_b <= 4
     assert len(cons) >= 3
+
+def test_option_a_last_fvg_of_range_inversion_triggers_ifvg_bos():
+    """
+    Verifies Option A: In an upward leg with 2 BISI FVGs (FVG #1 lower at [5002-5004],
+    FVG #2 higher at [5008-5010]), closing below FVG #2 at 5006.0 does NOT trigger a
+    Bearish IFVG_BOS because FVG #1 is still holding below. Only when price closes
+    below FVG #1 (< 5002.0) does Bearish IFVG_BOS fire.
+    """
+    from domain.fvg import FairValueGap
+    from domain.structure import detect_structure
+
+    times = pd.date_range("2026-10-16 09:30:00", periods=8, freq="1min", tz="America/New_York")
+    df = pd.DataFrame(
+        {
+            "open":  [5001, 5000, 5003, 5007, 5011, 5009, 5006, 5002],
+            "high":  [5002, 5002, 5005, 5009, 5012, 5010, 5007, 5003],
+            "low":   [5000, 4999, 5001, 5004, 5008, 5005, 5003, 5000],
+            "close": [5000, 5001, 5004, 5008, 5011, 5006, 5004, 5001],
+        },
+        index=times,
+    )
+    swings = [{"type": "SwingLow", "time": times[1], "price": 4999.0}]
+    fvgs = [
+        FairValueGap(fvg_type="BISI", top=5004.0, bottom=5002.0, creation_time=times[2]),
+        FairValueGap(fvg_type="BISI", top=5010.0, bottom=5008.0, creation_time=times[4]),
+    ]
+
+    df_struct = detect_structure(df, swings)
+    events = BacktestEngine._extract_structure_events(df_struct, tf_minutes=1, swings=swings, fvgs=fvgs)
+
+    ifvg_events = [e for e in events if e["kind"] == "IFVG_BOS"]
+    assert len(ifvg_events) == 1
+    # Must NOT fire at times[5] (close=5006 < 5008, when FVG #1 at 5002 is still intact);
+    # Must fire at times[7] when close=5001.0 < 5002.0 (inverting the last BISI of the leg)
+    assert ifvg_events[0]["close_time"] == times[7]
+    assert ifvg_events[0]["direction"] == "BEARISH"
+    assert int(df_struct["trend"].iloc[5]) != -1
+    assert int(df_struct["trend"].iloc[7]) == -1
