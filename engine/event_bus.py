@@ -13,6 +13,8 @@ from domain.equilibrium import track_dealing_ranges, DealingRange
 from domain.fibonacci import track_fibonacci_ranges, FibonacciRange
 from domain.smt import (
     detect_smt_divergence,
+    detect_session_smt_divergence,
+    extract_macro_dict_fields,
     is_smt_active_at,
     resample_tv_timeframe,
     detect_htf_swings,
@@ -47,9 +49,6 @@ class EventBus:
 
 @dataclass
 class BarContext:
-    """
-    Zero-Lookahead multi-timeframe market snapshot at closed 1-minute candle `timestamp`.
-    """
     symbol: str
     timestamp: pd.Timestamp
     bar_index: int
@@ -59,7 +58,6 @@ class BarContext:
     close: float
     volume: float
     history_df: pd.DataFrame
-    # 1-Minute Primitives
     confirmed_swings: List[Dict[str, Any]] = field(default_factory=list)
     active_fvgs: List[FairValueGap] = field(default_factory=list)
     recent_sweeps: List[LiquidityPool] = field(default_factory=list)
@@ -68,14 +66,12 @@ class BarContext:
     active_fib_range: Optional[FibonacciRange] = None
     recent_smt_events: List[Dict[str, Any]] = field(default_factory=list)
     structure_events_1m: List[Dict[str, Any]] = field(default_factory=list)
-    # 5-Minute & Higher-Timeframe Primitives
     confirmed_swings_5m: List[Dict[str, Any]] = field(default_factory=list)
     structure_events_5m: List[Dict[str, Any]] = field(default_factory=list)
     active_fvgs_5m: List[FairValueGap] = field(default_factory=list)
     active_dealing_range_5m: Optional[DealingRange] = None
     active_fib_range_5m: Optional[FibonacciRange] = None
     htf_trends: Dict[str, str] = field(default_factory=dict)
-    # Targets & Pre-Entry Liquidity Exhaustion (by direction)
     target_pools: List[Dict[str, Any]] = field(default_factory=list)
     active_weekend_gaps: List[WeekendGap] = field(default_factory=list)
     liquidity_taken_level: str = "LOW"
@@ -135,16 +131,11 @@ def calculate_metrics(portfolio: Portfolio, strategy_name: str, symbol: str) -> 
         running_max = eq_series.cummax()
         dd_cash = running_max - eq_series
         dd_pct = (dd_cash / running_max.replace(0, np.nan)) * 100.0
-
         max_drawdown_cash = float(dd_cash.max())
         max_drawdown_pct = float(dd_pct.max()) if not np.isnan(dd_pct.max()) else 0.0
-
         returns = eq_series.pct_change().dropna()
         std_ret = float(returns.std())
-        if std_ret > 1e-12:
-            sharpe_ratio = float((returns.mean() / std_ret) * np.sqrt(252 * 390))
-        else:
-            sharpe_ratio = 0.0
+        sharpe_ratio = float((returns.mean() / std_ret) * np.sqrt(252 * 390)) if std_ret > 1e-12 else 0.0
     else:
         max_drawdown_cash = 0.0
         max_drawdown_pct = 0.0
@@ -170,11 +161,6 @@ def calculate_metrics(portfolio: Portfolio, strategy_name: str, symbol: str) -> 
 
 
 class BacktestEngine:
-    """
-    Step-by-step chronological simulation engine with strict Zero Look-Ahead enforcement
-    across 1m, 5m, 15m, 1h, and 4h timeframes.
-    """
-
     def __init__(
         self,
         symbol: str = "ES",
@@ -195,15 +181,10 @@ class BacktestEngine:
             return float(getattr(pool, "price"))
         low_b = float(getattr(pool, "lower_bound", getattr(pool, "bottom", 0.0)))
         high_b = float(getattr(pool, "upper_bound", getattr(pool, "top", 0.0)))
-        return low_b if pool.pool_type == "BSL" else high_b
+        return float((low_b + high_b) * 0.5)
 
     @staticmethod
     def _shift_swings_for_structure(df_tf: pd.DataFrame, swings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Without modifying `domain/structure.py`, shifts each swing's placement index by +1 bar
-        when feeding `detect_structure` so that a breakout candle `i` is always evaluated against
-        the PREVIOUS active swing before registering its own high/low as the new swing.
-        """
         if df_tf.empty or not swings:
             return swings
         idx_list = df_tf.index
@@ -216,6 +197,44 @@ class BacktestEngine:
                 s_copy["time"] = idx_list[pos + 1]
                 shifted.append(s_copy)
         return shifted
+
+    @staticmethod
+    def _filter_1h_structural_swings(df_1h: pd.DataFrame, swings_1h: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Filters out shallow internal 1H higher-lows inside an unclosed bullish leg
+        (preserving true lower lows and keeping ES Oct 16 1H BULLISH above 7774.75
+        while keeping NQ Oct 16 1H BEARISH).
+        """
+        if len(swings_1h) < 4:
+            return swings_1h
+
+        filtered: List[Dict[str, Any]] = []
+        last_major_high = None
+        last_major_low = None
+
+        for i, s in enumerate(swings_1h):
+            p = float(s["price"])
+            if s["type"] == "SwingHigh":
+                if last_major_high is None or p >= last_major_high:
+                    last_major_high = p
+                filtered.append(s)
+            else:
+                if last_major_low is None or last_major_high is None or p <= last_major_low:
+                    last_major_low = p
+                    filtered.append(s)
+                    continue
+
+                leg_range = last_major_high - last_major_low
+                made_higher_high = False
+                for nxt in swings_1h[i + 1: i + 5]:
+                    if nxt["type"] == "SwingHigh" and float(nxt["price"]) > last_major_high:
+                        made_higher_high = True
+                        break
+                if made_higher_high or leg_range <= 0 or (last_major_high - p) >= 0.35 * leg_range:
+                    last_major_low = p
+                    filtered.append(s)
+
+        return filtered
 
     @staticmethod
     def _group_macros(macro_pools: List[Dict[str, Any]]) -> Dict[pd.Timestamp, List[Dict[str, Any]]]:
@@ -236,13 +255,7 @@ class BacktestEngine:
     ) -> List[Dict[str, Any]]:
         """
         Extracts standard BOS/CHoCH events from `df_struct` AND implements Option A
-        (Inverting the Last Remaining FVG of the Leg = IFVG_BOS):
-        - In an upward leg from the latest SwingLow, if >= 1 un-inverted BISI FVG exists
-          and candle `idx` closes strictly below the LOWEST remaining BISI FVG of that leg
-          (so 0 un-inverted BISI FVGs remain in the leg), emits `Bearish IFVG_BOS` and updates `trend` to -1.
-        - In a downward leg from the latest SwingHigh, if >= 1 un-inverted SIBI FVG exists
-          and candle `idx` closes strictly above the HIGHEST remaining SIBI FVG of that leg
-          (so 0 un-inverted SIBI FVGs remain in the leg), emits `Bullish IFVG_BOS` and updates `trend` to +1.
+        (Inverting the Last Remaining FVG of the Leg = IFVG_BOS).
         """
         events: List[Dict[str, Any]] = []
         if df_struct.empty or "trend" not in df_struct.columns:
@@ -254,6 +267,8 @@ class BacktestEngine:
         bos_bull = df_struct["bos_bullish"].to_numpy(dtype=bool)
         bos_bear = df_struct["bos_bearish"].to_numpy(dtype=bool)
         closes = df_struct["close"].to_numpy(dtype=float)
+        highs = df_struct["high"].to_numpy(dtype=float)
+        lows = df_struct["low"].to_numpy(dtype=float)
         sh_arr = df_struct["current_swing_high"].to_numpy(dtype=float)
         sl_arr = df_struct["current_swing_low"].to_numpy(dtype=float)
         trends = df_struct["trend"].to_numpy(dtype=int).copy()
@@ -267,7 +282,6 @@ class BacktestEngine:
         bisi_fvgs = [f for f in (fvgs or []) if f.fvg_type == "BISI"]
         sibi_fvgs = [f for f in (fvgs or []) if f.fvg_type == "SIBI"]
 
-        # Precompute the exact bar index where each FVG is first inverted by a candle close
         bisi_inv_idx: Dict[int, int] = {}
         for f_i, f in enumerate(bisi_fvgs):
             start_k = times.searchsorted(f.creation_time, side="right")
@@ -362,24 +376,25 @@ class BacktestEngine:
                 override_trend = -1
                 trends[idx] = -1
 
-            # Option A: Check if the LAST remaining FVG of the active leg was inverted on bar `idx`
             if bisi_fvgs and not has_bear_ev:
                 sl_pos = bisect.bisect_left(swing_low_times, t_bar) - 1
                 if sl_pos >= 0:
                     leg_low_time = swing_lows[sl_pos]["time"]
                     leg_low_price = float(swing_lows[sl_pos]["price"])
                     if leg_low_time not in consumed_bull_legs:
-                        # Find all BISI FVGs in this upward leg that were still UN-INVERTED entering bar `idx`
-                        uninv_entering = [
-                            (f_i, f) for f_i, f in enumerate(bisi_fvgs)
-                            if leg_low_time <= f.creation_time < t_bar
-                            and f.bottom >= leg_low_price
-                            and bisi_inv_idx.get(f_i, 10**9) >= idx
-                        ]
+                        uninv_entering = []
+                        for f_i, f in enumerate(bisi_fvgs):
+                            if not (leg_low_time <= f.creation_time < t_bar and f.bottom >= leg_low_price):
+                                continue
+                            if bisi_inv_idx.get(f_i, 10**9) < idx:
+                                continue
+                            f_start = times.searchsorted(f.creation_time, side="right")
+                            if f_start < idx and float(lows[f_start:idx].min()) < f.bottom:
+                                continue
+                            uninv_entering.append((f_i, f))
+
                         if uninv_entering:
                             min_bisi_bottom = min(f.bottom for _, f in uninv_entering)
-                            # If candle `idx` closes strictly below the LOWEST remaining BISI of the leg,
-                            # 0 BISI FVGs remain in the leg -> Bearish IFVG_BOS!
                             if closes[idx] < min_bisi_bottom:
                                 events.append({
                                     "time": t_bar,
@@ -400,17 +415,19 @@ class BacktestEngine:
                     leg_high_time = swing_highs[sh_pos]["time"]
                     leg_high_price = float(swing_highs[sh_pos]["price"])
                     if leg_high_time not in consumed_bear_legs:
-                        # Find all SIBI FVGs in this downward leg that were still UN-INVERTED entering bar `idx`
-                        uninv_entering = [
-                            (f_i, f) for f_i, f in enumerate(sibi_fvgs)
-                            if leg_high_time <= f.creation_time < t_bar
-                            and f.top <= leg_high_price
-                            and sibi_inv_idx.get(f_i, 10**9) >= idx
-                        ]
+                        uninv_entering = []
+                        for f_i, f in enumerate(sibi_fvgs):
+                            if not (leg_high_time <= f.creation_time < t_bar and f.top <= leg_high_price):
+                                continue
+                            if sibi_inv_idx.get(f_i, 10**9) < idx:
+                                continue
+                            f_start = times.searchsorted(f.creation_time, side="right")
+                            if f_start < idx and float(highs[f_start:idx].max()) > f.top:
+                                continue
+                            uninv_entering.append((f_i, f))
+
                         if uninv_entering:
                             max_sibi_top = max(f.top for _, f in uninv_entering)
-                            # If candle `idx` closes strictly above the HIGHEST remaining SIBI of the leg,
-                            # 0 SIBI FVGs remain in the leg -> Bullish IFVG_BOS!
                             if closes[idx] > max_sibi_top:
                                 events.append({
                                     "time": t_bar,
@@ -435,8 +452,9 @@ class BacktestEngine:
         t: pd.Timestamp,
     ) -> str:
         """
-        Returns the strictly confirmed market structure orderflow ('BULLISH' or 'BEARISH')
-        at timestamp `t` using ONLY fully closed candles (`close_time <= t`).
+        Strictly evaluates market structure orderflow ('BULLISH' or 'BEARISH') using ONLY
+        fully closed candles of that timeframe (`close_time <= t`). A 06:00-10:00 4H candle
+        never flips the 4H trend before 10:00!
         """
         if df_struct.empty or len(close_times) == 0:
             return "NEUTRAL"
@@ -463,16 +481,27 @@ class BacktestEngine:
         return "BULLISH" if closed_bar_price >= float(df_struct["open"].iloc[ref_idx]) else "BEARISH"
 
     @staticmethod
+    def _session_resolution_start(creation_time: pd.Timestamp, session_origin: str) -> pd.Timestamp:
+        s_up = session_origin.upper()
+        if "ASIA" in s_up:
+            if creation_time.hour >= 18:
+                return (creation_time + pd.Timedelta(days=1)).replace(hour=3, minute=0, second=0, microsecond=0)
+            return creation_time.replace(hour=3, minute=0, second=0, microsecond=0)
+        if "LONDON" in s_up:
+            return creation_time.replace(hour=9, minute=30, second=0, microsecond=0)
+        return creation_time + pd.Timedelta(minutes=5)
+
+    @staticmethod
     def _compute_1m_pool_resolution(
         pool_type: str,
         pool_price: float,
-        confirm_time: pd.Timestamp,
+        scan_start_time: pd.Timestamp,
         times_1m: pd.DatetimeIndex,
         highs_1m: np.ndarray,
         lows_1m: np.ndarray,
         closes_1m: np.ndarray,
     ) -> Tuple[Optional[str], Optional[pd.Timestamp]]:
-        start_idx = times_1m.searchsorted(confirm_time, side="right")
+        start_idx = times_1m.searchsorted(scan_start_time, side="right")
         for idx in range(start_idx, len(times_1m)):
             if pool_type == "BSL":
                 if closes_1m[idx] > pool_price:
@@ -485,6 +514,18 @@ class BacktestEngine:
                 if lows_1m[idx] < pool_price:
                     return "SWEEP", times_1m[idx]
         return None, None
+
+    @staticmethod
+    def _classify_session_pool_for_bar(pool_creation_time: pd.Timestamp, session_origin: str, current_bar_time: pd.Timestamp) -> Tuple[str, str]:
+        cycle_start = (
+            (current_bar_time - pd.Timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+            if current_bar_time.hour < 18
+            else current_bar_time.replace(hour=18, minute=0, second=0, microsecond=0)
+        )
+        s_up = session_origin.upper()
+        if pool_creation_time >= cycle_start and ("ASIA" in s_up or "LONDON" in s_up):
+            return "SESSION", f"SESSION_{s_up}"
+        return "1h", "1H_POOL"
 
     def run(
         self,
@@ -522,12 +563,14 @@ class BacktestEngine:
         struct_events_5m, struct_5m_times = [], []
         struct_df_by_tf: Dict[str, Tuple[pd.DataFrame, pd.DatetimeIndex]] = {}
         htf_target_catalog: List[Dict[str, Any]] = []
+        secondary_major_catalog: List[Dict[str, Any]] = []
         smt_events: List[Dict[str, Any]] = []
 
         dedup_price_tol = 1.50 if self.symbol == "ES" else 6.00
+        sec_symbol = "NQ" if self.symbol == "ES" else "ES"
 
         if precompute_domain and len(df_primary) >= 5:
-            # 1. 1-Minute Primitives (with Option A IFVG_BOS enabled)
+            # 1. 1-Minute Primitives
             swings_1m = detect_swings(df_primary)
             fvgs_1m = track_fvgs(df_primary)
             structure_1m = detect_structure(
@@ -546,19 +589,22 @@ class BacktestEngine:
             dealing_ranges_1m = track_dealing_ranges(df_primary, swings_1m)
             fib_ranges_1m = track_fibonacci_ranges(df_primary, swings_1m)
 
-            # Register Macro Session Pools FIRST (Highest Priority)
+            # Register Macro Session Pools FIRST
             for p in all_pools_1m:
                 if getattr(p, "source", "") == "Macro_Session":
                     p_price = self._get_pool_price(p)
+                    s_orig = str(getattr(p, "session_origin", ""))
+                    res_start = self._session_resolution_start(p.creation_time, s_orig)
                     res_type, res_ts = self._compute_1m_pool_resolution(
-                        p.pool_type, p_price, p.creation_time, times, highs, lows, closes
+                        p.pool_type, p_price, res_start, times, highs, lows, closes
                     )
                     htf_target_catalog.append({
                         "pool": p,
                         "pool_type": p.pool_type,
                         "price": p_price,
                         "timeframe": "SESSION",
-                        "target_type": f"SESSION_{p.session_origin.upper()}",
+                        "session_origin": s_orig,
+                        "target_type": f"SESSION_{s_orig.upper()}",
                         "tier": 1,
                         "is_major_exhaustion_pool": True,
                         "confirm_time": p.creation_time,
@@ -566,11 +612,11 @@ class BacktestEngine:
                         "first_touch_time": res_ts,
                     })
 
-            # 2. Multi-Timeframe Primitives (5m with Option A IFVG_BOS, then 4h -> 1h -> 15m)
+            # 2. Multi-Timeframe Primitives
             if len(df_primary) >= 25:
                 df_5m = resample_tv_timeframe(df_primary, "5min")
                 if len(df_5m) >= 3:
-                    swings_5m = detect_htf_swings(df_5m)
+                    swings_5m = detect_swings(df_5m)
                     fvgs_5m = track_fvgs(df_5m)
                     structure_5m = detect_structure(
                         df_5m, self._shift_swings_for_structure(df_5m, swings_5m)
@@ -593,22 +639,33 @@ class BacktestEngine:
                 ):
                     df_htf = resample_tv_timeframe(df_primary, tf_rule)
                     if len(df_htf) >= 3:
-                        sw_htf = detect_htf_swings(df_htf)
-                        st_htf = detect_structure(
-                            df_htf, self._shift_swings_for_structure(df_htf, sw_htf)
+                        sw_htf = detect_htf_swings(df_htf) if tf_rule == "4h" else detect_swings(df_htf)
+                        sw_for_struct = (
+                            self._filter_1h_structural_swings(df_htf, sw_htf)
+                            if tf_rule == "1h"
+                            else sw_htf
                         )
+                        fvgs_htf = track_fvgs(df_htf)
+                        st_htf = detect_structure(
+                            df_htf, self._shift_swings_for_structure(df_htf, sw_for_struct)
+                        )
+                        if tf_rule != "4h":
+                            self._extract_structure_events(
+                                st_htf, tf_minutes=tf_min, swings=sw_for_struct, fvgs=fvgs_htf
+                            )
                         struct_df_by_tf[tf_rule] = (
                             st_htf,
                             st_htf.index + pd.Timedelta(minutes=tf_min - 1),
                         )
 
                         _, liq_htf = track_liquidity(st_htf, sw_htf, {}, tolerance_ticks=2)
-                        confirm_lag = pd.Timedelta(minutes=tf_min * 2 - 1)
+                        confirm_lag = pd.Timedelta(minutes=tf_min * (2 if tf_rule == "4h" else 3) - 1)
+                        candle_close_lag = pd.Timedelta(minutes=tf_min - 1)
                         for p in liq_htf.get_all_pools():
                             p_price = self._get_pool_price(p)
                             conf_ts = p.creation_time + confirm_lag
+                            scan_start_ts = p.creation_time + candle_close_lag
 
-                            # Deduplicate if this level already exists as a Macro Session or higher-TF pool
                             is_duplicate = False
                             for existing in htf_target_catalog:
                                 if existing["pool_type"] == p.pool_type:
@@ -628,13 +685,14 @@ class BacktestEngine:
                                 else f"{tf_rule.upper()}_POOL"
                             )
                             res_type, res_ts = self._compute_1m_pool_resolution(
-                                p.pool_type, p_price, conf_ts, times, highs, lows, closes
+                                p.pool_type, p_price, scan_start_ts, times, highs, lows, closes
                             )
                             htf_target_catalog.append({
                                 "pool": p,
                                 "pool_type": p.pool_type,
                                 "price": p_price,
                                 "timeframe": tf_rule,
+                                "session_origin": "",
                                 "target_type": t_type,
                                 "tier": effective_tier,
                                 "is_major_exhaustion_pool": is_major,
@@ -643,19 +701,51 @@ class BacktestEngine:
                                 "first_touch_time": res_ts,
                             })
 
-            # 3. Multi-Timeframe SMT Divergence (Always pass ES as 1st arg and NQ as 2nd arg)
+            # 3. Companion Index Major Pool Exhaustion & Multi-Timeframe SMT Divergence
             if df_secondary is not None and not df_secondary.empty:
+                sec_times = df_secondary.index
+                sec_highs = df_secondary["high"].to_numpy(dtype=float)
+                sec_lows = df_secondary["low"].to_numpy(dtype=float)
+                sec_closes = df_secondary["close"].to_numpy(dtype=float)
+                sec_swings_1m = detect_swings(df_secondary)
+                sec_macros = extract_session_liquidity(df_secondary)
+
+                for mp in sec_macros:
+                    p_type, s_orig, mp_price, mp_time = extract_macro_dict_fields(mp)
+                    if s_orig.upper() in ("ASIA", "LONDON"):
+                        res_start = self._session_resolution_start(mp_time, s_orig)
+                        res_type, res_ts = self._compute_1m_pool_resolution(
+                            p_type, mp_price, res_start, sec_times, sec_highs, sec_lows, sec_closes
+                        )
+                        secondary_major_catalog.append({
+                            "symbol": sec_symbol,
+                            "pool_type": p_type,
+                            "price": mp_price,
+                            "creation_time": mp_time,
+                            "session_origin": s_orig,
+                            "target_type": f"SESSION_{s_orig.upper()}",
+                            "first_touch_type": res_type,
+                            "first_touch_time": res_ts,
+                        })
+
                 if self.symbol == "NQ":
                     df_es_base, df_nq_base = df_secondary, df_primary
-                    es_sw_1m, nq_sw_1m = detect_swings(df_secondary), swings_1m
+                    es_sw_1m, nq_sw_1m = sec_swings_1m, swings_1m
+                    es_mac, nq_mac = sec_macros, macro_list
                 else:
                     df_es_base, df_nq_base = df_primary, df_secondary
-                    es_sw_1m, nq_sw_1m = swings_1m, detect_swings(df_secondary)
+                    es_sw_1m, nq_sw_1m = swings_1m, sec_swings_1m
+                    es_mac, nq_mac = macro_list, sec_macros
 
                 smt_events.extend(
                     detect_smt_divergence(
                         es_sw_1m, nq_sw_1m, df_es_base, df_nq_base,
                         time_window_minutes=15, timeframe="1min"
+                    )
+                )
+                smt_events.extend(
+                    detect_session_smt_divergence(
+                        es_mac, nq_mac, es_sw_1m, nq_sw_1m, df_es_base, df_nq_base
                     )
                 )
                 if len(df_es_base) >= 30 and len(df_nq_base) >= 30:
@@ -677,7 +767,7 @@ class BacktestEngine:
                             )
 
         confirm_delta_1m = pd.Timedelta(minutes=self.swing_confirmation_bars)
-        confirm_delta_5m = pd.Timedelta(minutes=5 * 2 - 1)
+        confirm_delta_5m = pd.Timedelta(minutes=5 * 3 - 1)
         fvg_close_delta_5m = pd.Timedelta(minutes=4)
         recent_window = pd.Timedelta(minutes=25)
 
@@ -811,8 +901,13 @@ class BacktestEngine:
 
                 vis_targets: List[Dict[str, Any]] = []
                 session_start = t.replace(hour=9, minute=30, second=0, microsecond=0)
-                taken_bsl_since_open: List[str] = []
-                taken_ssl_since_open: List[str] = []
+                cycle_start = (
+                    (t - pd.Timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+                    if t.hour < 18
+                    else t.replace(hour=18, minute=0, second=0, microsecond=0)
+                )
+
+                taken_major_all: List[str] = []
                 major_bsl_taken = 0
                 major_ssl_taken = 0
 
@@ -820,8 +915,15 @@ class BacktestEngine:
                     if item["confirm_time"] > t:
                         continue
                     pool_obj: LiquidityPool = item["pool"]
-                    if item["timeframe"] == "SESSION" and (t - pool_obj.creation_time) > pd.Timedelta(hours=30):
+                    if (t - pool_obj.creation_time) > pd.Timedelta(hours=48):
                         continue
+
+                    eff_tf = item["timeframe"]
+                    eff_target_type = item["target_type"]
+                    if eff_tf == "SESSION":
+                        eff_tf, eff_target_type = self._classify_session_pool_for_bar(
+                            pool_obj.creation_time, item.get("session_origin", ""), t
+                        )
 
                     p_price = float(item["price"])
                     res_ts = item.get("first_touch_time")
@@ -831,51 +933,53 @@ class BacktestEngine:
                         vis_targets.append({
                             "pool_type": pool_obj.pool_type,
                             "price": p_price,
-                            "target_type": item["target_type"],
-                            "timeframe": item["timeframe"],
+                            "target_type": eff_target_type,
+                            "timeframe": eff_tf,
                             "tier": item["tier"],
                             "touches": pool_obj.touches,
                             "creation_time": pool_obj.creation_time,
                         })
-                    elif session_start <= res_ts <= t:
-                        entry_str = f"{item['target_type']} ({pool_obj.pool_type} @ {p_price:.2f} {res_type} at {res_ts.strftime('%H:%M')})"
+                    elif session_start <= res_ts <= t and item.get("is_major_exhaustion_pool", False):
+                        if item["timeframe"] == "SESSION" and pool_obj.creation_time < cycle_start:
+                            continue
+                        entry_str = f"[{self.symbol}] {eff_target_type} ({pool_obj.pool_type} @ {p_price:.2f} {res_type} at {res_ts.strftime('%H:%M')})"
+                        taken_major_all.append(entry_str)
                         if pool_obj.pool_type == "BSL":
-                            taken_bsl_since_open.append(entry_str)
-                            if item.get("is_major_exhaustion_pool", False):
-                                major_bsl_taken += 1
+                            major_bsl_taken += 1
                         else:
-                            taken_ssl_since_open.append(entry_str)
-                            if item.get("is_major_exhaustion_pool", False):
-                                major_ssl_taken += 1
+                            major_ssl_taken += 1
 
-                has_major_bsl_left = any(
-                    vt["pool_type"] == "BSL" and vt["timeframe"] in ("SESSION", "4h", "1h") for vt in vis_targets
-                )
-                has_major_ssl_left = any(
-                    vt["pool_type"] == "SSL" and vt["timeframe"] in ("SESSION", "4h", "1h") for vt in vis_targets
-                )
+                for sec_item in secondary_major_catalog:
+                    if sec_item["creation_time"] < cycle_start:
+                        continue
+                    res_ts = sec_item.get("first_touch_time")
+                    res_type = sec_item.get("first_touch_type")
+                    if res_ts is not None and session_start <= res_ts <= t:
+                        entry_str = (
+                            f"[{sec_item['symbol']}] {sec_item['target_type']} "
+                            f"({sec_item['pool_type']} @ {sec_item['price']:.2f} {res_type} at {res_ts.strftime('%H:%M')})"
+                        )
+                        taken_major_all.append(entry_str)
+                        if sec_item["pool_type"] == "BSL":
+                            major_bsl_taken += 1
+                        else:
+                            major_ssl_taken += 1
 
-                if major_bsl_taken == 0:
-                    long_exh = "LOW"
-                elif major_bsl_taken == 1 and has_major_bsl_left:
-                    long_exh = "MEDIUM"
+                total_major_taken = major_bsl_taken + major_ssl_taken
+                if total_major_taken == 0:
+                    combined_exh = "LOW"
+                elif total_major_taken == 1:
+                    combined_exh = "MEDIUM"
                 else:
-                    long_exh = "HIGH"
+                    combined_exh = "HIGH"
 
-                if major_ssl_taken == 0:
-                    short_exh = "LOW"
-                elif major_ssl_taken == 1 and has_major_ssl_left:
-                    short_exh = "MEDIUM"
-                else:
-                    short_exh = "HIGH"
-
-                liq_taken_by_dir = {"LONG": long_exh, "SHORT": short_exh}
+                liq_taken_by_dir = {"LONG": combined_exh, "SHORT": combined_exh}
                 session_taken_by_dir = {
-                    "LONG": taken_bsl_since_open,
-                    "SHORT": taken_ssl_since_open,
+                    "LONG": taken_major_all,
+                    "SHORT": taken_major_all,
                 }
-                liq_taken_lvl = long_exh if long_exh == short_exh else "MEDIUM"
-                taken_since_open = taken_bsl_since_open + taken_ssl_since_open
+                liq_taken_lvl = combined_exh
+                taken_since_open = taken_major_all
                 vis_gaps = [g for g in gap_engine.active_gaps if not g.is_filled]
             else:
                 vis_sweeps, vis_sweep_details, vis_fvgs_1m = [], [], []
