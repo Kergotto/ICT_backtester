@@ -6,6 +6,7 @@ import pandas as pd
 
 from core.data_loader import resample_timeframe
 from domain.swings import detect_swings
+from domain.fvg import track_fvgs, FairValueGap
 
 
 # Official SMT Lifecycle Status Constants
@@ -91,6 +92,32 @@ def detect_htf_swings(df_htf: pd.DataFrame) -> List[Dict[str, Any]]:
         if lows[i] < lows[i - 1] and lows[i] <= lows[i + 1]:
             swings.append({"type": "SwingLow", "time": times[i], "price": float(lows[i])})
     return swings
+
+
+def _augment_4h_leg_origin_swings(df_4h: pd.DataFrame, base_swings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if len(df_4h) < 3:
+        return base_swings
+
+    highs = df_4h["high"].to_numpy(dtype=float)
+    lows = df_4h["low"].to_numpy(dtype=float)
+    times = df_4h.index
+
+    existing_high_times = {s["time"] for s in base_swings if s["type"] == "SwingHigh"}
+    existing_low_times = {s["time"] for s in base_swings if s["type"] == "SwingLow"}
+    augmented = list(base_swings)
+
+    for i in range(len(df_4h) - 1):
+        if highs[i] > highs[i + 1] and lows[i] > lows[i + 1]:
+            if times[i] not in existing_high_times:
+                augmented.append({"type": "SwingHigh", "time": times[i], "price": float(highs[i])})
+                existing_high_times.add(times[i])
+        if lows[i] < lows[i + 1] and highs[i] < highs[i + 1]:
+            if times[i] not in existing_low_times:
+                augmented.append({"type": "SwingLow", "time": times[i], "price": float(lows[i])})
+                existing_low_times.add(times[i])
+
+    augmented.sort(key=lambda s: s["time"])
+    return augmented
 
 
 def get_smt_status_at(smt: Dict[str, Any], timestamp: pd.Timestamp) -> str:
@@ -191,6 +218,7 @@ def _find_prior_target_beyond_confirm(
     before_time: pd.Timestamp,
     reference_price: float,
     is_bearish: bool,
+    htf_min: int = 1,
     lookback_count: int = 15,
 ) -> Optional[float]:
     end_idx = bisect.bisect_left(swing_times, before_time)
@@ -204,7 +232,68 @@ def _find_prior_target_beyond_confirm(
             candidates.append(p)
     if not candidates:
         return None
-    return max(candidates) if is_bearish else min(candidates)
+    if htf_min == 1:
+        return float(min(candidates)) if is_bearish else float(max(candidates))
+    return float(max(candidates)) if is_bearish else float(min(candidates))
+
+
+def _check_ltf_ifvg_mss_level(
+    t: pd.Timestamp,
+    bar_idx: int,
+    anchor_idx: int,
+    prev_anchor_time: pd.Timestamp,
+    ltf_swings: List[Dict[str, Any]],
+    ltf_swing_times: List[pd.Timestamp],
+    ltf_fvgs: List[FairValueGap],
+    ltf_times: pd.DatetimeIndex,
+    ltf_closes: np.ndarray,
+    is_bearish: bool,
+) -> Optional[float]:
+    if not ltf_fvgs:
+        return None
+
+    pos = bisect.bisect_left(ltf_swing_times, t) - 1
+    if pos >= 0 and ltf_swings[pos]["time"] >= prev_anchor_time:
+        leg_start_time = ltf_swings[pos]["time"]
+        leg_start_price = float(ltf_swings[pos]["price"])
+    else:
+        leg_start_time = prev_anchor_time
+        leg_start_price = -1e9 if is_bearish else 1e9
+
+    pre_sweep_cutoff = min(bar_idx, anchor_idx)
+
+    if is_bearish:
+        uninv = []
+        for f in ltf_fvgs:
+            if f.fvg_type != "BISI":
+                continue
+            if not (leg_start_time <= f.creation_time <= t and f.bottom >= leg_start_price):
+                continue
+            f_start = ltf_times.searchsorted(f.creation_time, side="right")
+            if f_start < pre_sweep_cutoff and float(ltf_closes[f_start:pre_sweep_cutoff].min()) < f.bottom:
+                continue
+            uninv.append(f)
+        if uninv:
+            min_bottom = float(min(f.bottom for f in uninv))
+            if ltf_closes[bar_idx] < min_bottom:
+                return min_bottom
+    else:
+        uninv = []
+        for f in ltf_fvgs:
+            if f.fvg_type != "SIBI":
+                continue
+            if not (leg_start_time <= f.creation_time <= t and f.top <= leg_start_price):
+                continue
+            f_start = ltf_times.searchsorted(f.creation_time, side="right")
+            if f_start < pre_sweep_cutoff and float(ltf_closes[f_start:pre_sweep_cutoff].max()) > f.top:
+                continue
+            uninv.append(f)
+        if uninv:
+            max_top = float(max(f.top for f in uninv))
+            if ltf_closes[bar_idx] > max_top:
+                return max_top
+
+    return None
 
 
 def _evaluate_post_confirmation_lifecycle(
@@ -292,6 +381,10 @@ def detect_smt_divergence(
     ltf_label = str(cfg["ltf_label"])
     sync_bars = int(cfg["sync_bars"])
 
+    if htf_min == 240:
+        es_swings = _augment_4h_leg_origin_swings(df_es, es_swings)
+        nq_swings = _augment_4h_leg_origin_swings(df_nq, nq_swings)
+
     if htf_min > 1 and df_es_1m is not None and df_nq_1m is not None and not df_es_1m.empty and not df_nq_1m.empty:
         if ltf_rule == "1min":
             df_es_ltf = df_es_1m
@@ -310,6 +403,9 @@ def detect_smt_divergence(
         ltf_nq_swings = nq_swings
         if htf_min > 1:
             ltf_min = htf_min
+
+    ltf_es_fvgs = track_fvgs(df_es_ltf) if (htf_min == 240 and not df_es_ltf.empty) else []
+    ltf_nq_fvgs = track_fvgs(df_nq_ltf) if (htf_min == 240 and not df_nq_ltf.empty) else []
 
     df_es_res = df_es_1m if (df_es_1m is not None and not df_es_1m.empty) else df_es_ltf
     df_nq_res = df_nq_1m if (df_nq_1m is not None and not df_nq_1m.empty) else df_nq_ltf
@@ -379,11 +475,14 @@ def detect_smt_divergence(
     ltf_close_offset = pd.Timedelta(minutes=max(0, ltf_min - 1))
     seen_confirmations = set()
 
+    # Keep confirmed SwingHighs FIRST for 1m, 5m, 15m, 1h (preserving exact 09:50 Oct 13 & 09:51 Oct 14 behavior);
+    # On 4h (where bars are 4 hours wide on the exact same clock grid), pair same-timestamp 4H candles directly.
     bear_candidates: List[Tuple[pd.Timestamp, float, pd.Timestamp, float]] = []
-    for curr_es in es_highs:
-        curr_nq = get_closest_swing_fast(curr_es['time'], nq_highs, nq_high_times, max_diff_minutes=sync_minutes)
-        if curr_nq:
-            bear_candidates.append((curr_es['time'], float(curr_es['price']), curr_nq['time'], float(curr_nq['price'])))
+    if htf_min < 240:
+        for curr_es in es_highs:
+            curr_nq = get_closest_swing_fast(curr_es['time'], nq_highs, nq_high_times, max_diff_minutes=sync_minutes)
+            if curr_nq:
+                bear_candidates.append((curr_es['time'], float(curr_es['price']), curr_nq['time'], float(curr_nq['price'])))
 
     if htf_min > 1 and has_es_ohlc and has_nq_ohlc:
         for k in range(len(es_times)):
@@ -393,10 +492,11 @@ def detect_smt_divergence(
                 bear_candidates.append((t_bar, float(es_high_arr[k]), t_bar, float(nq_high_arr[nq_k])))
 
     bull_candidates: List[Tuple[pd.Timestamp, float, pd.Timestamp, float]] = []
-    for curr_es in es_lows:
-        curr_nq = get_closest_swing_fast(curr_es['time'], nq_lows, nq_low_times, max_diff_minutes=sync_minutes)
-        if curr_nq:
-            bull_candidates.append((curr_es['time'], float(curr_es['price']), curr_nq['time'], float(curr_nq['price'])))
+    if htf_min < 240:
+        for curr_es in es_lows:
+            curr_nq = get_closest_swing_fast(curr_es['time'], nq_lows, nq_low_times, max_diff_minutes=sync_minutes)
+            if curr_nq:
+                bull_candidates.append((curr_es['time'], float(curr_es['price']), curr_nq['time'], float(curr_nq['price'])))
 
     if htf_min > 1 and has_es_ohlc and has_nq_ohlc:
         for k in range(len(es_times)):
@@ -404,6 +504,10 @@ def detect_smt_divergence(
             nq_k = nq_times.searchsorted(t_bar)
             if nq_k < len(nq_times) and nq_times[nq_k] == t_bar:
                 bull_candidates.append((t_bar, float(es_low_arr[k]), t_bar, float(nq_low_arr[nq_k])))
+
+    # On 4h, a 4-hour candle sweep must confirm on 1h within 4 hours (4 1H bars), not 20 hours later!
+    start_step = 0 if htf_min == 240 else 1
+    end_step = 5 if htf_min == 240 else 21
 
     # BEARISH SMT
     for c_es_time, c_es_price, c_nq_time, c_nq_price in bear_candidates:
@@ -470,12 +574,16 @@ def detect_smt_divergence(
                     c_nq_time, htf_min, ltf_nq_times, ltf_nq_high_arr, prev_nq['price'], is_bearish=True
                 )
 
+            es_anchor_idx = ltf_es_times.searchsorted(ltf_anchor) if has_ltf_es_close else 0
+            nq_anchor_idx = ltf_nq_times.searchsorted(ltf_anchor) if has_ltf_nq_close else 0
+
             confirm_time = None
             confirm_asset = None
             confirm_level = None
+            confirm_kind = "MSS"
             disrespected = False
 
-            for step in range(1, 21):
+            for step in range(start_step, end_step):
                 t = ltf_anchor + pd.Timedelta(minutes=step * ltf_min)
                 es_idx = ltf_es_times.searchsorted(t) if has_ltf_es_close else -1
                 has_es_bar = has_ltf_es_close and es_idx < len(ltf_es_times) and ltf_es_times[es_idx] == t
@@ -504,27 +612,52 @@ def detect_smt_divergence(
                     else None
                 )
 
+                es_ifvg_level = (
+                    _check_ltf_ifvg_mss_level(
+                        t, es_idx, es_anchor_idx, prev_es['time'], ltf_es_lows, ltf_es_low_times,
+                        ltf_es_fvgs, ltf_es_times, ltf_es_close_arr, is_bearish=True
+                    )
+                    if (htf_min == 240 and has_es_bar)
+                    else None
+                )
+                nq_ifvg_level = (
+                    _check_ltf_ifvg_mss_level(
+                        t, nq_idx, nq_anchor_idx, prev_nq['time'], ltf_nq_lows, ltf_nq_low_times,
+                        ltf_nq_fvgs, ltf_nq_times, ltf_nq_close_arr, is_bearish=True
+                    )
+                    if (htf_min == 240 and has_nq_bar)
+                    else None
+                )
+
                 if htf_min > 1:
                     if has_ltf_es_ohlc and has_es_bar and es_intervening_low is not None:
                         if es_mss_level is None or es_intervening_low < es_mss_level:
                             if ltf_es_low_arr[es_idx] < es_intervening_low and not (
-                                es_mss_level is not None and ltf_es_close_arr[es_idx] < es_mss_level
+                                (es_mss_level is not None and ltf_es_close_arr[es_idx] < es_mss_level)
+                                or es_ifvg_level is not None
                             ):
                                 disrespected = True
                                 break
                     if has_ltf_nq_ohlc and has_nq_bar and nq_intervening_low is not None:
                         if nq_mss_level is None or nq_intervening_low < nq_mss_level:
                             if ltf_nq_low_arr[nq_idx] < nq_intervening_low and not (
-                                nq_mss_level is not None and ltf_nq_close_arr[nq_idx] < nq_mss_level
+                                (nq_mss_level is not None and ltf_nq_close_arr[nq_idx] < nq_mss_level)
+                                or nq_ifvg_level is not None
                             ):
                                 disrespected = True
                                 break
 
                 if has_es_bar and es_mss_level is not None and ltf_es_close_arr[es_idx] < es_mss_level:
-                    confirm_time, confirm_asset, confirm_level = t, "ES", es_mss_level
+                    confirm_time, confirm_asset, confirm_level, confirm_kind = t, "ES", es_mss_level, "MSS"
                     break
                 if has_nq_bar and nq_mss_level is not None and ltf_nq_close_arr[nq_idx] < nq_mss_level:
-                    confirm_time, confirm_asset, confirm_level = t, "NQ", nq_mss_level
+                    confirm_time, confirm_asset, confirm_level, confirm_kind = t, "NQ", nq_mss_level, "MSS"
+                    break
+                if es_ifvg_level is not None:
+                    confirm_time, confirm_asset, confirm_level, confirm_kind = t, "ES", es_ifvg_level, "IFVG_MSS"
+                    break
+                if nq_ifvg_level is not None:
+                    confirm_time, confirm_asset, confirm_level, confirm_kind = t, "NQ", nq_ifvg_level, "IFVG_MSS"
                     break
 
             if not disrespected and confirm_time is not None:
@@ -546,15 +679,22 @@ def detect_smt_divergence(
                     else float(confirm_level)
                 )
 
+                es_intervening_valid = es_intervening_low is not None and es_intervening_low < es_ref_low
+                nq_intervening_valid = nq_intervening_low is not None and nq_intervening_low < nq_ref_low
+
                 es_target = (
                     es_intervening_low
-                    if (es_intervening_low is not None and es_intervening_low < es_ref_low)
-                    else _find_prior_target_beyond_confirm(es_lows, es_low_times, c_es_time, es_ref_low, is_bearish=True)
+                    if es_intervening_valid
+                    else _find_prior_target_beyond_confirm(
+                        es_lows, es_low_times, c_es_time, es_ref_low, is_bearish=True, htf_min=htf_min
+                    )
                 )
                 nq_target = (
                     nq_intervening_low
-                    if (nq_intervening_low is not None and nq_intervening_low < nq_ref_low)
-                    else _find_prior_target_beyond_confirm(nq_lows, nq_low_times, c_nq_time, nq_ref_low, is_bearish=True)
+                    if nq_intervening_valid
+                    else _find_prior_target_beyond_confirm(
+                        nq_lows, nq_low_times, c_nq_time, nq_ref_low, is_bearish=True, htf_min=htf_min
+                    )
                 )
 
                 conf_close_time = confirm_time + ltf_close_offset
@@ -563,8 +703,15 @@ def detect_smt_divergence(
                 es_held_lvl = float(prev_es['price']) if nq_swept_bsl else float(c_es_price)
                 nq_held_lvl = float(prev_nq['price']) if es_swept_bsl else float(c_nq_price)
 
-                check_es_t = True if htf_min < 60 else bool(es_swept_bsl or not res_nq_ohlc)
-                check_nq_t = True if htf_min < 60 else bool(nq_swept_bsl or not res_es_ohlc)
+                if htf_min >= 60:
+                    check_es_t = bool(es_swept_bsl or not res_nq_ohlc)
+                    check_nq_t = bool(nq_swept_bsl or not res_es_ohlc)
+                elif htf_min == 1 and not es_intervening_valid:
+                    check_es_t = (confirm_asset == "ES")
+                    check_nq_t = (confirm_asset == "NQ")
+                else:
+                    check_es_t = True
+                    check_nq_t = True
 
                 status, resolved_time = _evaluate_post_confirmation_lifecycle(
                     is_bearish=True,
@@ -598,14 +745,14 @@ def detect_smt_divergence(
                         f"[{creation_time.strftime('%m-%d %H:%M')}] Bearish SMT ({timeframe}): "
                         f"ES swept BSL {prev_es['price']:.2f} (from {prev_es['time'].strftime('%m-%d %H:%M')}) "
                         f"to {c_es_price:.2f}, while NQ held below {prev_nq['price']:.2f} (from {prev_nq['time'].strftime('%m-%d %H:%M')}) "
-                        f"--> {ltf_label} MSS on {confirm_asset} at [{conf_close_time.strftime('%m-%d %H:%M')}] (< {confirm_level:.2f}) {status_tag}"
+                        f"--> {ltf_label} {confirm_kind} on {confirm_asset} at [{conf_close_time.strftime('%m-%d %H:%M')}] (< {confirm_level:.2f}) {status_tag}"
                     )
                 else:
                     desc = (
                         f"[{creation_time.strftime('%m-%d %H:%M')}] Bearish SMT ({timeframe}): "
                         f"NQ swept BSL {prev_nq['price']:.2f} (from {prev_nq['time'].strftime('%m-%d %H:%M')}) "
                         f"to {c_nq_price:.2f}, while ES held below {prev_es['price']:.2f} (from {prev_es['time'].strftime('%m-%d %H:%M')}) "
-                        f"--> {ltf_label} MSS on {confirm_asset} at [{conf_close_time.strftime('%m-%d %H:%M')}] (< {confirm_level:.2f}) {status_tag}"
+                        f"--> {ltf_label} {confirm_kind} on {confirm_asset} at [{conf_close_time.strftime('%m-%d %H:%M')}] (< {confirm_level:.2f}) {status_tag}"
                     )
 
                 is_intraday_post_open = bool(
@@ -698,12 +845,16 @@ def detect_smt_divergence(
                     c_nq_time, htf_min, ltf_nq_times, ltf_nq_low_arr, prev_nq['price'], is_bearish=False
                 )
 
+            es_anchor_idx = ltf_es_times.searchsorted(ltf_anchor) if has_ltf_es_close else 0
+            nq_anchor_idx = ltf_nq_times.searchsorted(ltf_anchor) if has_ltf_nq_close else 0
+
             confirm_time = None
             confirm_asset = None
             confirm_level = None
+            confirm_kind = "MSS"
             disrespected = False
 
-            for step in range(1, 21):
+            for step in range(start_step, end_step):
                 t = ltf_anchor + pd.Timedelta(minutes=step * ltf_min)
                 es_idx = ltf_es_times.searchsorted(t) if has_ltf_es_close else -1
                 has_es_bar = has_ltf_es_close and es_idx < len(ltf_es_times) and ltf_es_times[es_idx] == t
@@ -732,27 +883,52 @@ def detect_smt_divergence(
                     else None
                 )
 
+                es_ifvg_level = (
+                    _check_ltf_ifvg_mss_level(
+                        t, es_idx, es_anchor_idx, prev_es['time'], ltf_es_highs, ltf_es_high_times,
+                        ltf_es_fvgs, ltf_es_times, ltf_es_close_arr, is_bearish=False
+                    )
+                    if (htf_min == 240 and has_es_bar)
+                    else None
+                )
+                nq_ifvg_level = (
+                    _check_ltf_ifvg_mss_level(
+                        t, nq_idx, nq_anchor_idx, prev_nq['time'], ltf_nq_highs, ltf_nq_high_times,
+                        ltf_nq_fvgs, ltf_nq_times, ltf_nq_close_arr, is_bearish=False
+                    )
+                    if (htf_min == 240 and has_nq_bar)
+                    else None
+                )
+
                 if htf_min > 1:
                     if has_ltf_es_ohlc and has_es_bar and es_intervening_high is not None:
                         if es_mss_level is None or es_intervening_high > es_mss_level:
                             if ltf_es_high_arr[es_idx] > es_intervening_high and not (
-                                es_mss_level is not None and ltf_es_close_arr[es_idx] > es_mss_level
+                                (es_mss_level is not None and ltf_es_close_arr[es_idx] > es_mss_level)
+                                or es_ifvg_level is not None
                             ):
                                 disrespected = True
                                 break
                     if has_ltf_nq_ohlc and has_nq_bar and nq_intervening_high is not None:
                         if nq_mss_level is None or nq_intervening_high > nq_mss_level:
                             if ltf_nq_high_arr[nq_idx] > nq_intervening_high and not (
-                                nq_mss_level is not None and ltf_nq_close_arr[nq_idx] > nq_mss_level
+                                (nq_mss_level is not None and ltf_nq_close_arr[nq_idx] > nq_mss_level)
+                                or nq_ifvg_level is not None
                             ):
                                 disrespected = True
                                 break
 
                 if has_es_bar and es_mss_level is not None and ltf_es_close_arr[es_idx] > es_mss_level:
-                    confirm_time, confirm_asset, confirm_level = t, "ES", es_mss_level
+                    confirm_time, confirm_asset, confirm_level, confirm_kind = t, "ES", es_mss_level, "MSS"
                     break
                 if has_nq_bar and nq_mss_level is not None and ltf_nq_close_arr[nq_idx] > nq_mss_level:
-                    confirm_time, confirm_asset, confirm_level = t, "NQ", nq_mss_level
+                    confirm_time, confirm_asset, confirm_level, confirm_kind = t, "NQ", nq_mss_level, "MSS"
+                    break
+                if es_ifvg_level is not None:
+                    confirm_time, confirm_asset, confirm_level, confirm_kind = t, "ES", es_ifvg_level, "IFVG_MSS"
+                    break
+                if nq_ifvg_level is not None:
+                    confirm_time, confirm_asset, confirm_level, confirm_kind = t, "NQ", nq_ifvg_level, "IFVG_MSS"
                     break
 
             if not disrespected and confirm_time is not None:
@@ -774,15 +950,22 @@ def detect_smt_divergence(
                     else float(confirm_level)
                 )
 
+                es_intervening_valid = es_intervening_high is not None and es_intervening_high > es_ref_high
+                nq_intervening_valid = nq_intervening_high is not None and nq_intervening_high > nq_ref_high
+
                 es_target = (
                     es_intervening_high
-                    if (es_intervening_high is not None and es_intervening_high > es_ref_high)
-                    else _find_prior_target_beyond_confirm(es_highs, es_high_times, c_es_time, es_ref_high, is_bearish=False)
+                    if es_intervening_valid
+                    else _find_prior_target_beyond_confirm(
+                        es_highs, es_high_times, c_es_time, es_ref_high, is_bearish=False, htf_min=htf_min
+                    )
                 )
                 nq_target = (
                     nq_intervening_high
-                    if (nq_intervening_high is not None and nq_intervening_high > nq_ref_high)
-                    else _find_prior_target_beyond_confirm(nq_highs, nq_high_times, c_nq_time, nq_ref_high, is_bearish=False)
+                    if nq_intervening_valid
+                    else _find_prior_target_beyond_confirm(
+                        nq_highs, nq_high_times, c_nq_time, nq_ref_high, is_bearish=False, htf_min=htf_min
+                    )
                 )
 
                 conf_close_time = confirm_time + ltf_close_offset
@@ -791,8 +974,15 @@ def detect_smt_divergence(
                 es_held_lvl = float(prev_es['price']) if nq_swept_ssl else float(c_es_price)
                 nq_held_lvl = float(prev_nq['price']) if es_swept_ssl else float(c_nq_price)
 
-                check_es_t = True if htf_min < 60 else bool(es_swept_ssl or not res_nq_ohlc)
-                check_nq_t = True if htf_min < 60 else bool(nq_swept_ssl or not res_es_ohlc)
+                if htf_min >= 60:
+                    check_es_t = bool(es_swept_ssl or not res_nq_ohlc)
+                    check_nq_t = bool(nq_swept_ssl or not res_es_ohlc)
+                elif htf_min == 1 and not es_intervening_valid:
+                    check_es_t = (confirm_asset == "ES")
+                    check_nq_t = (confirm_asset == "NQ")
+                else:
+                    check_es_t = True
+                    check_nq_t = True
 
                 status, resolved_time = _evaluate_post_confirmation_lifecycle(
                     is_bearish=False,
@@ -826,14 +1016,14 @@ def detect_smt_divergence(
                         f"[{creation_time.strftime('%m-%d %H:%M')}] Bullish SMT ({timeframe}): "
                         f"ES swept SSL {prev_es['price']:.2f} (from {prev_es['time'].strftime('%m-%d %H:%M')}) "
                         f"to {c_es_price:.2f}, while NQ held above {prev_nq['price']:.2f} (from {prev_nq['time'].strftime('%m-%d %H:%M')}) "
-                        f"--> {ltf_label} MSS on {confirm_asset} at [{conf_close_time.strftime('%m-%d %H:%M')}] (> {confirm_level:.2f}) {status_tag}"
+                        f"--> {ltf_label} {confirm_kind} on {confirm_asset} at [{conf_close_time.strftime('%m-%d %H:%M')}] (> {confirm_level:.2f}) {status_tag}"
                     )
                 else:
                     desc = (
                         f"[{creation_time.strftime('%m-%d %H:%M')}] Bullish SMT ({timeframe}): "
                         f"NQ swept SSL {prev_nq['price']:.2f} (from {prev_nq['time'].strftime('%m-%d %H:%M')}) "
                         f"to {c_nq_price:.2f}, while ES held above {prev_es['price']:.2f} (from {prev_es['time'].strftime('%m-%d %H:%M')}) "
-                        f"--> {ltf_label} MSS on {confirm_asset} at [{conf_close_time.strftime('%m-%d %H:%M')}] (> {confirm_level:.2f}) {status_tag}"
+                        f"--> {ltf_label} {confirm_kind} on {confirm_asset} at [{conf_close_time.strftime('%m-%d %H:%M')}] (> {confirm_level:.2f}) {status_tag}"
                     )
 
                 is_intraday_post_open = bool(
@@ -873,12 +1063,6 @@ def detect_session_smt_divergence(
     df_es_1m: pd.DataFrame,
     df_nq_1m: pd.DataFrame,
 ) -> List[Dict[str, Any]]:
-    """
-    Detects intraday Session SMT Divergences on unbroken Asia/London pools and attaches
-    the opposing session high/low as the target so the SMT is properly marked RESPECTED
-    as soon as that opposing session pool is taken (e.g., 2026-10-13 09:32 Asia SSL SMT
-    -> RESPECTED at 09:41 when London BSL is swept).
-    """
     events: List[Dict[str, Any]] = []
     if df_es_1m.empty or df_nq_1m.empty:
         return events
@@ -944,7 +1128,6 @@ def detect_session_smt_divergence(
             if nq_pre_idx < nq_start and float(nq_low_arr[nq_pre_idx:nq_start].min()) < nq_lvl:
                 continue
 
-        # Find opposing session target level (London/Asia High for Bullish SMT; London/Asia Low for Bearish SMT)
         opp_type = "BSL" if p_type == "SSL" else "SSL"
         es_opp_candidates = [
             es_by_key[(trade_date, s_name, opp_type)][0]
