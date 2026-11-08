@@ -1,6 +1,6 @@
 from pathlib import Path
 from typing import List, Optional
-from core.data_loader import load_historical_data, resample_timeframe
+from core.data_loader import load_historical_data, load_databento_pair, resample_timeframe
 from domain.equilibrium import track_dealing_ranges
 from domain.fibonacci import track_fibonacci_ranges
 from domain.fvg import track_fvgs
@@ -18,8 +18,14 @@ from visualization.plotter import plot_liquidity_chart
 RUN_BACKTEST_AUDIT = True
 ENABLE_PLOTTING = False
 
+# --- DATA SOURCE & DATE RANGE SETTINGS ---
+# Set USE_DATABENTO_5Y = True to load from your 5-year Databento dataset in `data/`
+USE_DATABENTO_5Y = True
+BACKTEST_START_DATE: Optional[str] = "2026-10-09 00:09:00"
+BACKTEST_END_DATE: Optional[str] = "2026-10-16 16:59:00"
+
 # Focus dates for TradingView inspection (matches Trades #74 and #75 in your journal)
-# Set to None to print detailed cards for ALL dates in the sample
+# Set to None to print detailed cards for ALL executed trades in the date range
 FOCUS_AUDIT_DATES: Optional[List[str]] = ["2026-10-13", "2026-10-14", "2026-10-16"]
 
 # --- HTF CHART VERIFICATION SETTINGS (Used when ENABLE_PLOTTING = True) ---
@@ -31,7 +37,7 @@ HTF_OVERLAY_TF = "15min"
 def group_macros(macro_pools):
     grouped = {}
     for pool in macro_pools:
-        t = pool['time']
+        t = pool["time"]
         if t not in grouped:
             grouped[t] = []
         grouped[t].append(pool)
@@ -40,7 +46,10 @@ def group_macros(macro_pools):
 
 def print_comparative_table(results: List[BacktestResult]) -> None:
     print("\n" + "=" * 105)
-    print(f"{'STRATEGY NAME':<34} | {'SYM':<3} | {'TRADES':>6} | {'WIN %':>6} | {'NET PnL ($)':>12} | {'PF':>5} | {'SHARPE':>6} | {'MAX DD %':>8} | {'AVG R':>6}")
+    print(
+        f"{'STRATEGY NAME':<34} | {'SYM':<3} | {'TRADES':>6} | {'WIN %':>6} | "
+        f"{'NET PnL ($)':>12} | {'PF':>5} | {'SHARPE':>6} | {'MAX DD %':>8} | {'AVG R':>6}"
+    )
     print("-" * 105)
     for r in results:
         pf_str = f"{r.profit_factor:.2f}" if r.profit_factor != float("inf") else "  INF"
@@ -128,7 +137,6 @@ def print_tradingview_audit(
                 if meta.get("cons"):
                     print(f"    • Cons (-)        : {'; '.join(meta['cons'])}")
         else:
-            # Print detailed diagnostic card explaining why no trade was taken on `d_str`
             summary = strategy.daily_window_summary.get(d_str, {})
             htf = summary.get("htf_trends", {})
             ctx_time = summary.get("context_time", "09:50")
@@ -146,18 +154,26 @@ def print_tradingview_audit(
             if summary.get("smt_descriptions"):
                 print(f"    • Active SMTs     : {'; '.join(summary['smt_descriptions'])}")
             if diags:
-                print(f"    • Why Not Taken   :")
+                print("    • Why Not Taken   :")
                 for reason in diags[:8]:
                     print(f"        - {reason}")
             else:
                 print("    • Why Not Taken   : No 1m BOS/CHoCH/IFVG_BOS trigger occurred during 09:40 - 10:30 NY.")
 
+
 def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
     print("1. Loading 1-minute historical data (ES & NQ)...")
-    df_es_1m = load_historical_data(es_path)
-    df_es_1m = df_es_1m[(df_es_1m["high"] - df_es_1m["low"]) < 40.0]
+    if USE_DATABENTO_5Y:
+        df_es_1m, df_nq_1m = load_databento_pair(
+            data_dir=es_path.parent,
+            start_date=BACKTEST_START_DATE,
+            end_date=BACKTEST_END_DATE,
+        )
+    else:
+        df_es_1m = load_historical_data(es_path, start_date=BACKTEST_START_DATE, end_date=BACKTEST_END_DATE)
+        df_nq_1m = load_historical_data(nq_path, start_date=BACKTEST_START_DATE, end_date=BACKTEST_END_DATE)
 
-    df_nq_1m = load_historical_data(nq_path)
+    df_es_1m = df_es_1m[(df_es_1m["high"] - df_es_1m["low"]) < 40.0]
     df_nq_1m = df_nq_1m[(df_nq_1m["high"] - df_nq_1m["low"]) < 150.0]
 
     print(
@@ -234,11 +250,18 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
 
 def run_pipeline(primary_path: Path, secondary_path: Path, timeframe: str = "1min"):
     print("1. Loading 1-minute historical data (ES & NQ)...")
-    df_es_1m = load_historical_data(primary_path)
-    df_es_1m = df_es_1m[(df_es_1m['high'] - df_es_1m['low']) < 40.0]
+    if USE_DATABENTO_5Y:
+        df_es_1m, df_nq_1m = load_databento_pair(
+            data_dir=primary_path.parent,
+            start_date=BACKTEST_START_DATE,
+            end_date=BACKTEST_END_DATE,
+        )
+    else:
+        df_es_1m = load_historical_data(primary_path, start_date=BACKTEST_START_DATE, end_date=BACKTEST_END_DATE)
+        df_nq_1m = load_historical_data(secondary_path, start_date=BACKTEST_START_DATE, end_date=BACKTEST_END_DATE)
 
-    df_nq_1m = load_historical_data(secondary_path)
-    df_nq_1m = df_nq_1m[(df_nq_1m['high'] - df_nq_1m['low']) < 150.0]
+    df_es_1m = df_es_1m[(df_es_1m["high"] - df_es_1m["low"]) < 40.0]
+    df_nq_1m = df_nq_1m[(df_nq_1m["high"] - df_nq_1m["low"]) < 150.0]
 
     print("2. Extracting Macro Session Liquidity...")
     es_macro_by_time = group_macros(extract_session_liquidity(df_es_1m))
@@ -315,7 +338,7 @@ def run_pipeline(primary_path: Path, secondary_path: Path, timeframe: str = "1mi
     return (
         df_es, es_swings, es_pools, es_fvgs, es_ranges, es_fibs,
         df_nq, nq_swings, nq_pools, nq_fvgs, nq_ranges, nq_fibs,
-        gap_engine, smt_events
+        gap_engine, smt_events,
     )
 
 
@@ -330,7 +353,7 @@ def main():
         (
             df_es, es_swings, es_pools, es_fvgs, es_ranges, es_fibs,
             df_nq, nq_swings, nq_pools, nq_fvgs, nq_ranges, nq_fibs,
-            gap_engine, smt_events
+            gap_engine, smt_events,
         ) = run_pipeline(es_data_path, nq_data_path, timeframe=CHART_TIMEFRAME)
 
         print(f"Rendering {CHART_TIMEFRAME} chart overlays...")
@@ -340,8 +363,8 @@ def main():
             return
 
         if smt_events:
-            target_time = smt_events[-1]['time']
-            target_idx = common_index.get_indexer([target_time], method='nearest')[0]
+            target_time = smt_events[-1]["time"]
+            target_idx = common_index.get_indexer([target_time], method="nearest")[0]
             start_idx = max(0, target_idx - 60)
             end_idx = min(len(common_index) - 1, target_idx + 60)
         else:
@@ -357,12 +380,12 @@ def main():
         plot_liquidity_chart(
             plot_df_es, es_pools, es_swings,
             fvgs=[], ranges=[], fibs=[],
-            title=f"E-Mini S&P 500 (ES) - {CHART_TIMEFRAME}"
+            title=f"E-Mini S&P 500 (ES) - {CHART_TIMEFRAME}",
         )
         plot_liquidity_chart(
             plot_df_nq, nq_pools, nq_swings,
             fvgs=[], ranges=[], fibs=[],
-            title=f"E-Mini Nasdaq 100 (NQ) - {CHART_TIMEFRAME}"
+            title=f"E-Mini Nasdaq 100 (NQ) - {CHART_TIMEFRAME}",
         )
 
 
