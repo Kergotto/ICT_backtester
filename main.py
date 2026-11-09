@@ -13,20 +13,29 @@ from engine.session_engine import extract_session_liquidity
 from strategies.base import BuyAndHoldStrategy, RandomEntryStrategy
 from strategies.ict_multi_tf import ICTMultiTimeframeStrategy
 from visualization.plotter import plot_liquidity_chart
+import pandas as pd
 
 # --- EXECUTION MODES ---
 RUN_BACKTEST_AUDIT = True
 ENABLE_PLOTTING = False
 
 # --- DATA SOURCE & DATE RANGE SETTINGS ---
-# Set USE_DATABENTO_5Y = True to load from your 5-year Databento dataset in `data/`
 USE_DATABENTO_5Y = True
-BACKTEST_START_DATE: Optional[str] = "2026-10-09 00:09:00"
-BACKTEST_END_DATE: Optional[str] = "2026-10-16 16:59:00"
+BACKTEST_START_DATE: Optional[str] = "2026-09-29 00:00:00"
+BACKTEST_END_DATE: Optional[str] = "2026-10-27 17:00:00"
 
-# Focus dates for TradingView inspection (matches Trades #74 and #75 in your journal)
-# Set to None to print detailed cards for ALL executed trades in the date range
-FOCUS_AUDIT_DATES: Optional[List[str]] = ["2026-10-13", "2026-10-14", "2026-10-16"]
+# Focus dates for October Journal Trades (#70 to #77) + Oct 16
+FOCUS_AUDIT_DATES: Optional[List[str]] = [
+    "2026-10-01",  # Trade #70 (NQ Short: TP1 + TP2 + FullTP)
+    "2026-10-02",  # Trade #71 (NQ Long: TP1 -> BE)
+    "2026-10-06",  # Trade #72 (ES Long: TP1 + TP2 -> BE)
+    "2026-10-08",  # Trade #73 (NQ Long: Loss)
+    "2026-10-13",  # Trade #74 (ES Short: FullTP Win)
+    "2026-10-14",  # Trade #75 (NQ Short: FullTP Win)
+    "2026-10-16",  # No-Trade day
+    "2026-10-21",  # Trade #76 (ES Short: TP1 -> BE)
+    "2026-10-26",  # Trade #77 (NQ Short: TP1 -> BE)
+]
 
 # --- HTF CHART VERIFICATION SETTINGS (Used when ENABLE_PLOTTING = True) ---
 CHART_TIMEFRAME = "15min"
@@ -45,20 +54,21 @@ def group_macros(macro_pools):
 
 
 def print_comparative_table(results: List[BacktestResult]) -> None:
-    print("\n" + "=" * 105)
+    print("\n" + "=" * 114)
     print(
-        f"{'STRATEGY NAME':<34} | {'SYM':<3} | {'TRADES':>6} | {'WIN %':>6} | "
+        f"{'STRATEGY NAME':<34} | {'SYM':<3} | {'TRADES':>6} | {'W/BE/L':>8} | {'WIN %':>6} | "
         f"{'NET PnL ($)':>12} | {'PF':>5} | {'SHARPE':>6} | {'MAX DD %':>8} | {'AVG R':>6}"
     )
-    print("-" * 105)
+    print("-" * 114)
     for r in results:
         pf_str = f"{r.profit_factor:.2f}" if r.profit_factor != float("inf") else "  INF"
+        w_be_l = f"{r.win_count}/{r.be_count}/{r.loss_count}"
         print(
-            f"{r.strategy_name:<34} | {r.symbol:<3} | {r.total_trades:>6} | "
+            f"{r.strategy_name:<34} | {r.symbol:<3} | {r.total_trades:>6} | {w_be_l:>8} | "
             f"{r.win_rate:>5.1f}% | {r.net_profit:>+12.2f} | {pf_str:>5} | "
             f"{r.sharpe_ratio:>6.2f} | {r.max_drawdown_pct:>7.2f}% | {r.avg_r_multiple:>+5.2f}R"
         )
-    print("=" * 105)
+    print("=" * 114)
 
 
 def print_tradingview_audit(
@@ -88,6 +98,9 @@ def print_tradingview_audit(
             for tr in day_trades:
                 trade_counter += 1
                 meta = tr.metadata or {}
+                outcome = meta.get("outcome", "WIN" if tr.net_pnl > 0 else "LOSS")
+                icon = "✅" if outcome == "WIN" else ("🟡" if outcome == "BE" else "❌")
+
                 htf = meta.get("htf_trends", {})
                 htf_str = (
                     f"4H={htf.get('4h', '?')}, 1H={htf.get('1h', '?')}, "
@@ -97,7 +110,7 @@ def print_tradingview_audit(
                 sl_anchor_tag = f" ({sl_anchor})" if sl_anchor else ""
 
                 print(
-                    f"\n  ✅ [{d_str} — Trade #{trade_counter}] {symbol} {tr.direction} | Grade: {meta.get('grade', '?')} (Score: {meta.get('score', '?')}/10)"
+                    f"\n  {icon} [{d_str} — Trade #{trade_counter}] {symbol} {tr.direction} | Result: {outcome} | Grade: {meta.get('grade', '?')} (Score: {meta.get('score', '?')}/10)"
                 )
                 print(
                     f"    • Entry Time (NY) : {tr.entry_time.strftime('%Y-%m-%d %H:%M')}  --> Check this 1m bar on TradingView"
@@ -109,11 +122,27 @@ def print_tradingview_audit(
                     f"    • Prices          : Entry = {tr.entry_price:.2f} | SL = {tr.stop_loss:.2f}{sl_anchor_tag} | TP = {tr.take_profit:.2f} | Exit = {tr.exit_price:.2f}"
                 )
                 print(
-                    f"    • Risk / Reward   : Planned RR = {meta.get('planned_rr', 0.0):.2f}R | Realized = {tr.r_multiple:+.2f}R | Net PnL = ${tr.net_pnl:+.2f} (Qty: {tr.quantity})"
+                    f"    • Risk / Reward   : Planned FullTP RR = {meta.get('planned_rr', 0.0):.2f}R | Realized = {tr.r_multiple:+.2f}R | Net PnL = ${tr.net_pnl:+.2f} (Qty: {tr.quantity})"
                 )
-                print(
-                    f"    • Target (DOL)    : {meta.get('target_type', '?')} (Tier {meta.get('target_tier', '?')})"
-                )
+
+                partials_plan = meta.get("partial_targets", [])
+                if partials_plan:
+                    rem_pct = int(round((1.0 - sum(p.get("weight", 0.30) for p in partials_plan)) * 100))
+                    parts_str = " | ".join(
+                        f"{p['label']} ({int(round(p.get('weight', 0.30) * 100))}%): {p['price']:.2f} ({p['rr']:.2f}R, {p['target_type']})"
+                        for p in partials_plan
+                    )
+                    print(
+                        f"    • Targets (DOL)   : {parts_str} | FullTP ({rem_pct}%): {tr.take_profit:.2f} ({meta.get('planned_rr', 0.0):.2f}R, {meta.get('target_type', '?')})"
+                    )
+                else:
+                    print(
+                        f"    • Target (DOL)    : {meta.get('target_type', '?')} (Tier {meta.get('target_tier', '?')})"
+                    )
+
+                if meta.get("management_summary"):
+                    print(f"    • Position Mgmt   : {meta['management_summary']}")
+
                 print(
                     f"    • 1m Entry Trigger: {meta.get('entry_trigger_detail', '?')}"
                 )
@@ -173,8 +202,16 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
         df_es_1m = load_historical_data(es_path, start_date=BACKTEST_START_DATE, end_date=BACKTEST_END_DATE)
         df_nq_1m = load_historical_data(nq_path, start_date=BACKTEST_START_DATE, end_date=BACKTEST_END_DATE)
 
+    es_lb = getattr(df_es_1m, "_htf_lookback_df", None)
+    nq_lb = getattr(df_nq_1m, "_htf_lookback_df", None)
+
     df_es_1m = df_es_1m[(df_es_1m["high"] - df_es_1m["low"]) < 40.0]
     df_nq_1m = df_nq_1m[(df_nq_1m["high"] - df_nq_1m["low"]) < 150.0]
+
+    if es_lb is not None:
+        object.__setattr__(df_es_1m, "_htf_lookback_df", es_lb[(es_lb["high"] - es_lb["low"]) < 40.0])
+    if nq_lb is not None:
+        object.__setattr__(df_nq_1m, "_htf_lookback_df", nq_lb[(nq_lb["high"] - nq_lb["low"]) < 150.0])
 
     print(
         f"   ES Range: {df_es_1m.index[0]} -> {df_es_1m.index[-1]} ({len(df_es_1m)} bars)\n"
@@ -217,7 +254,8 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
         ict_all_grades = ICTMultiTimeframeStrategy(
             stop_loss_points=default_sl,
             reward_risk_ratio=2.0,
-            min_rr=1.25,
+            min_rr=1.65,
+            min_tp1_rr=0.80,
             risk_per_trade_pct=0.01,
             use_dynamic_sizing=True,
             sl_mode="tight_1m",
@@ -232,7 +270,8 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
         ict_grade_a = ICTMultiTimeframeStrategy(
             stop_loss_points=default_sl,
             reward_risk_ratio=2.0,
-            min_rr=1.25,
+            min_rr=1.65,
+            min_tp1_rr=0.80,
             risk_per_trade_pct=0.01,
             use_dynamic_sizing=True,
             sl_mode="tight_1m",
