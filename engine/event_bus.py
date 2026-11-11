@@ -183,7 +183,6 @@ def calculate_metrics(portfolio: Portfolio, strategy_name: str, symbol: str) -> 
 
 
 class BacktestEngine:
-    # Shared caches across ES and NQ engine instances so NQ reuses ES+NQ computations
     _GLOBAL_SYMBOL_CACHE: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
     _GLOBAL_SMT_CACHE: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
 
@@ -417,9 +416,13 @@ class BacktestEngine:
                                 continue
                             if bisi_inv_idx.get(f_i, 10**9) < idx:
                                 continue
-                            f_start = bisi_start_idx[f_i]
-                            if f_start < idx and float(lows[f_start:idx].min()) < f.bottom:
-                                continue
+                            # For 1m/5m/15m, ignore FVGs whose bottom was already breached on an earlier candle;
+                            # for 1H (`tf_minutes == 60`), an FVG that was merely wicked (like 03:00 on Oct 1 NQ)
+                            # remains the active last FVG of the range until a candle CLOSES below `f.bottom`!
+                            if tf_minutes < 60:
+                                f_start = bisi_start_idx[f_i]
+                                if f_start < idx and float(lows[f_start:idx].min()) < f.bottom:
+                                    continue
                             uninv_entering.append((f_i, f))
 
                         if uninv_entering:
@@ -453,9 +456,10 @@ class BacktestEngine:
                                 continue
                             if sibi_inv_idx.get(f_i, 10**9) < idx:
                                 continue
-                            f_start = sibi_start_idx[f_i]
-                            if f_start < idx and float(highs[f_start:idx].max()) > f.top:
-                                continue
+                            if tf_minutes < 60:
+                                f_start = sibi_start_idx[f_i]
+                                if f_start < idx and float(highs[f_start:idx].max()) > f.top:
+                                    continue
                             uninv_entering.append((f_i, f))
 
                         if uninv_entering:
@@ -566,7 +570,10 @@ class BacktestEngine:
         symbol: str,
         df_active: pd.DataFrame,
     ) -> Dict[str, Any]:
-        df_htf_src = df_active.attrs.get("htf_lookback_df", df_active)
+        df_htf_src = getattr(df_active, "_htf_lookback_df", None)
+        if df_htf_src is None:
+            df_htf_src = df_active.attrs.get("htf_lookback_df", df_active)
+
         sym_key = (
             symbol,
             len(df_active),
@@ -587,7 +594,6 @@ class BacktestEngine:
         htf_lows = df_htf_src["low"].to_numpy(dtype=float)
         htf_closes = df_htf_src["close"].to_numpy(dtype=float)
 
-        # Compute ATH / multi-week high proximity on the 60-day lookback dataframe
         htf_run_max = np.maximum.accumulate(htf_highs)
         near_ath_mask = htf_highs >= (htf_run_max * 0.9955)
         near_ath_dates = {ts.date() for ts in htf_times[near_ath_mask]}
@@ -606,7 +612,6 @@ class BacktestEngine:
         is_short_synthetic = len(df_active) < 25
 
         if len(df_active) >= 5:
-            # 1. 1-Minute Primitives (computed ONLY on active test range, not 60-day warm-up!)
             swings_1m = detect_swings(df_active)
             fvgs_1m = track_fvgs(df_active)
             structure_1m = detect_structure(
@@ -661,7 +666,6 @@ class BacktestEngine:
                             "first_touch_time": res_ts,
                         })
 
-            # 2. 5-Minute Primitives (on active test range) & HTF (15m, 1h, 4h) Primitives (on 60-day lookback)
             if not is_short_synthetic:
                 df_5m = resample_tv_timeframe(df_active, "5min")
                 if len(df_5m) >= 3:
@@ -688,7 +692,8 @@ class BacktestEngine:
                 ):
                     df_htf = resample_tv_timeframe(df_htf_src, tf_rule)
                     if len(df_htf) >= 3:
-                        sw_htf = detect_htf_swings(df_htf) if tf_rule == "4h" else detect_swings(df_htf)
+                        sw_for_liq = detect_htf_swings(df_htf)
+                        sw_htf = sw_for_liq if tf_rule == "4h" else detect_swings(df_htf)
                         sw_for_struct = (
                             self._filter_1h_structural_swings(df_htf, sw_htf)
                             if tf_rule == "1h"
@@ -699,36 +704,74 @@ class BacktestEngine:
                             df_htf, self._shift_swings_for_structure(df_htf, sw_for_struct)
                         )
                         if tf_rule != "4h":
+                            # On 1H, pass 3-bar pivots (`sw_for_liq`) filtered for major legs to `_extract_structure_events`
+                            # so 3-bar range lows (like 09-30 20:00 @ 30724.75 on NQ) anchor the last FVG of the range!
+                            sw_for_ifvg = (
+                                self._filter_1h_structural_swings(df_htf, sw_for_liq)
+                                if tf_rule == "1h"
+                                else sw_for_struct
+                            )
                             self._extract_structure_events(
-                                st_htf, tf_minutes=tf_min, swings=sw_for_struct, fvgs=fvgs_htf
+                                st_htf, tf_minutes=tf_min, swings=sw_for_ifvg, fvgs=fvgs_htf
                             )
                         struct_df_by_tf[tf_rule] = (
                             st_htf,
                             st_htf.index + pd.Timedelta(minutes=tf_min - 1),
                         )
 
-                        sw_for_liq = detect_htf_swings(df_htf) if tf_rule in ("4h", "15min") else sw_htf
                         _, liq_htf = track_liquidity(st_htf, sw_for_liq, {}, tolerance_ticks=2)
-                        confirm_lag = pd.Timedelta(minutes=tf_min * (2 if tf_rule in ("4h", "15min") else 3) - 1)
+                        confirm_lag = pd.Timedelta(minutes=tf_min * 2 - 1)
                         candle_close_lag = pd.Timedelta(minutes=tf_min - 1)
+
+                        raw_htf_candidates: List[Tuple[LiquidityPool, float, pd.Timestamp]] = []
                         for p in liq_htf.get_all_pools():
                             p_price = self._get_pool_price(p)
-                            conf_ts = p.creation_time + confirm_lag
+                            raw_htf_candidates.append((p, p_price, p.creation_time))
+
                             scan_start_ts = p.creation_time + candle_close_lag
+                            _, res_ts = self._compute_1m_pool_resolution(
+                                p.pool_type, p_price, scan_start_ts, htf_times, htf_highs, htf_lows, htf_closes
+                            )
+                            if res_ts is not None:
+                                matching_later_swings = [
+                                    sw for sw in sw_for_liq
+                                    if (
+                                        (p.pool_type == "SSL" and sw["type"] == "SwingLow")
+                                        or (p.pool_type == "BSL" and sw["type"] == "SwingHigh")
+                                    )
+                                    and p.creation_time < sw["time"] <= res_ts
+                                    and abs(float(sw["price"]) - p_price) <= dedup_price_tol
+                                ]
+                                if matching_later_swings:
+                                    latest_sw = matching_later_swings[-1]
+                                    sw_p = float(latest_sw["price"])
+                                    new_pool = LiquidityPool(
+                                        pool_type=p.pool_type,
+                                        lower_bound=sw_p - 0.25,
+                                        upper_bound=sw_p + 0.25,
+                                        creation_time=latest_sw["time"],
+                                        touches=p.touches,
+                                        source="Structural",
+                                    )
+                                    raw_htf_candidates.append((new_pool, sw_p, latest_sw["time"]))
+
+                        for p, p_price, orig_creation_ts in raw_htf_candidates:
+                            conf_ts = orig_creation_ts + confirm_lag
+                            scan_start_ts = orig_creation_ts + candle_close_lag
 
                             res_type, res_ts = self._compute_1m_pool_resolution(
                                 p.pool_type, p_price, scan_start_ts, htf_times, htf_highs, htf_lows, htf_closes
                             )
-                            # Skip pools that were already broken/swept before our active test period even begins
                             if res_ts is not None and res_ts < times[0]:
                                 continue
 
                             is_duplicate = False
                             for existing in htf_target_catalog:
                                 if existing["pool_type"] == p.pool_type:
-                                    if abs(existing["price"] - p_price) <= dedup_price_tol and abs(
-                                        (existing["pool"].creation_time - p.creation_time).total_seconds()
-                                    ) <= 12 * 3600:
+                                    if (
+                                        abs(existing["price"] - p_price) <= dedup_price_tol
+                                        and abs((existing["pool"].creation_time - orig_creation_ts).total_seconds()) <= 12 * 3600
+                                    ):
                                         is_duplicate = True
                                         break
                             if is_duplicate:
@@ -872,8 +915,6 @@ class BacktestEngine:
                 es_mac = es_data["macro_list"]
                 nq_mac = nq_data["macro_list"]
 
-                # Filter 1m swings to 08:00-10:45 NY when running on multi-day datasets
-                # (1m SMTs expire after 90m, so overnight/afternoon 1m SMTs can never be active at 09:40-10:30 NY)
                 if len(df_es_base) >= 250:
                     t_start_1m, t_end_1m = dtime(8, 0), dtime(10, 45)
                     es_sw_1m_morning = [s for s in es_sw_1m if t_start_1m <= s["time"].time() <= t_end_1m]
@@ -1076,6 +1117,9 @@ class BacktestEngine:
                     vis_swings_1m = swings_1m[:end_sw1]
                     idx_1m_st = bisect.bisect_right(struct_1m_times, t)
                     vis_struct_1m = struct_events_1m[max(0, idx_1m_st - 12):idx_1m_st]
+                    hi_fvg1 = bisect.bisect_right(fvg_1m_creation_times, t)
+                    lo_fvg1_recent = bisect.bisect_left(fvg_1m_creation_times, t - pd.Timedelta(minutes=15))
+                    recent_fvgs_1m_all = fvgs_1m[lo_fvg1_recent:hi_fvg1]
                     ctx = BarContext(
                         symbol=self.symbol,
                         timestamp=t,
@@ -1087,6 +1131,7 @@ class BacktestEngine:
                         volume=v,
                         history_df=df_primary.iloc[: i + 1],
                         confirmed_swings=vis_swings_1m,
+                        recent_fvgs_all=recent_fvgs_1m_all,
                         structure_events_1m=vis_struct_1m,
                     )
                     strategy.on_bar(ctx, broker, portfolio)
@@ -1204,13 +1249,12 @@ class BacktestEngine:
                 )
 
                 taken_major_all: List[str] = []
-                major_bsl_taken = 0
-                major_ssl_taken = 0
+                unique_major_pools_taken = set()
+                htf_pools_taken_candidates: List[Tuple[str, str, float, pd.Timestamp]] = []
                 min_creation_cutoff = t - max_pool_age
 
                 lookback_48h_idx = max(0, i - 2880)
                 high_48h = float(highs[lookback_48h_idx : i + 1].max())
-                low_48h = float(lows[lookback_48h_idx : i + 1].min())
 
                 for item in htf_target_catalog:
                     if item["confirm_time"] > t:
@@ -1223,11 +1267,10 @@ class BacktestEngine:
                     is_unbroken = (res_ts is None or res_ts > t)
                     is_unmitigated_historical = (
                         is_unbroken
+                        and htf_trends.get("ath_regime") == "ACTIVE"
+                        and pool_obj.pool_type == "BSL"
                         and item["timeframe"] in ("15min", "1h", "4h")
-                        and (
-                            (pool_obj.pool_type == "BSL" and p_price > high_48h)
-                            or (pool_obj.pool_type == "SSL" and p_price < low_48h)
-                        )
+                        and p_price > high_48h
                     )
 
                     if pool_obj.creation_time < min_creation_cutoff and not is_unmitigated_historical:
@@ -1255,10 +1298,12 @@ class BacktestEngine:
                             continue
                         entry_str = f"[{self.symbol}] {eff_target_type} ({pool_obj.pool_type} @ {p_price:.2f} {res_type} at {res_ts.strftime('%H:%M')})"
                         taken_major_all.append(entry_str)
-                        if pool_obj.pool_type == "BSL":
-                            major_bsl_taken += 1
+                        if eff_tf == "SESSION":
+                            unique_major_pools_taken.add(("SESSION", eff_target_type, pool_obj.pool_type))
                         else:
-                            major_ssl_taken += 1
+                            htf_pools_taken_candidates.append(
+                                (eff_target_type, pool_obj.pool_type, p_price, pool_obj.creation_time)
+                            )
 
                 for sec_item in secondary_major_catalog:
                     if sec_item["creation_time"] < cycle_start:
@@ -1271,15 +1316,18 @@ class BacktestEngine:
                             f"({sec_item['pool_type']} @ {sec_item['price']:.2f} {res_type} at {res_ts.strftime('%H:%M')})"
                         )
                         taken_major_all.append(entry_str)
-                        if sec_item["pool_type"] == "BSL":
-                            major_bsl_taken += 1
-                        else:
-                            major_ssl_taken += 1
+                        unique_major_pools_taken.add(("SESSION", sec_item["target_type"], sec_item["pool_type"]))
 
-                total_major_taken = major_bsl_taken + major_ssl_taken
-                if total_major_taken == 0:
+                swept_session_sides = {side for kind, _, side in unique_major_pools_taken if kind == "SESSION"}
+                for eff_t_type, p_side, p_pr, c_ts in htf_pools_taken_candidates:
+                    if c_ts >= cycle_start and p_side in swept_session_sides:
+                        continue
+                    unique_major_pools_taken.add(("HTF", eff_t_type, p_side, round(p_pr, 1)))
+
+                total_unique_major_taken = len(unique_major_pools_taken)
+                if total_unique_major_taken == 0:
                     combined_exh = "LOW"
-                elif total_major_taken == 1:
+                elif total_unique_major_taken == 1:
                     combined_exh = "MEDIUM"
                 else:
                     combined_exh = "HIGH"

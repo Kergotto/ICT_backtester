@@ -21,10 +21,12 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
     """
     Discretionary-to-Quantitative ICT Multi-Timeframe Strategy with:
     - Two Entry Archetypes (5M_TREND_CONTINUATION and SMT_REVERSAL_MODEL)
-    - ATH + Dual-Index All-HTF-Bullish Continuation Override & Bearish SMT Filter
+    - ATH + Dual-Index HTF-Bullish Continuation Override & Bearish SMT Filter
+    - Overextended Exhaustion-Leg Filter (HIGH Liquidity Exhaustion + Large Completed Leg)
     - Multi-Target Partial Take-Profit Engine (TP1 [30%], optional TP2 [30%], FullTP [70%/40%])
+    - High-Confluence 3-TP Exception (TP1 >= 0.55R when TP2 >= 1.0R and FullTP >= 1.60R exist)
     - Homerun (>= 3.0R FullTP) 15m Liquidity Pool Partials
-    - Natural 1m Structural Pullback & Liquidity Cluster Trailing Stop Engine
+    - Natural 1m Structural Pullback, FVG Inversion & Liquidity Cluster Trailing Stop Engine
     """
     name: str = "ICT_MultiConfluence_Strategy"
 
@@ -32,7 +34,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         self,
         stop_loss_points: float = 6.0,
         reward_risk_ratio: float = 2.0,
-        min_rr: float = 1.65,
+        min_rr: float = 1.60,
         min_tp1_rr: float = 0.80,
         max_rr: float = 3.85,
         partial_cut_pct: float = 0.30,
@@ -202,8 +204,8 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                         "priority": 2,
                     })
 
-        eff_tp1_min_rr = 0.68 if allow_exception_tp1 else self.min_tp1_rr
-        full_tp_min_rr = max(1.65, self.min_rr) if self.enable_partials else self.min_rr
+        eff_tp1_min_rr = 0.55 if allow_exception_tp1 else self.min_tp1_rr
+        full_tp_min_rr = 1.60 if allow_exception_tp1 else (max(1.65, self.min_rr) if self.enable_partials else self.min_rr)
 
         prio1_targets = [c for c in all_directional_targets if c["priority"] == 1 and c["rr"] >= 0.25]
         if prio1_targets:
@@ -217,13 +219,13 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                     f"{closest_prio1['rr']:.2f}R (< min TP1 {eff_tp1_min_rr:.2f}R); skipping past a major target is forbidden.",
                 )
 
-            # MULTI-TP PATH A: Closest Priority-1 pool is in [eff_tp1_min_rr, 1.65R) -> use as TP1 (30%) and look for FullTP >= 1.65R
+            # MULTI-TP PATH A: Closest Priority-1 pool is in [eff_tp1_min_rr, full_tp_min_rr) -> use as TP1 (30%) and look for FullTP >= 1.60R
             if self.enable_partials and closest_prio1["rr"] < full_tp_min_rr:
                 tp1_cand = closest_prio1
                 further_cands = [
                     c for c in all_directional_targets
                     if c["priority"] <= 2
-                    and (tp1_cand["rr"] + 0.40) <= c["rr"] <= self.max_rr
+                    and (tp1_cand["rr"] + 0.35) <= c["rr"] <= self.max_rr
                 ]
                 further_cands.sort(key=lambda x: (x["rr"], x["priority"]))
 
@@ -240,7 +242,8 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
 
                 mid_cands = [
                     c for c in further_cands
-                    if (tp1_cand["rr"] + 0.40) <= c["rr"] <= (full_tp["rr"] - 0.40)
+                    if c["priority"] <= 2
+                    and (tp1_cand["rr"] + 0.35) <= c["rr"] <= (full_tp["rr"] - 0.35)
                 ]
                 if not mid_cands and tp1_cand["rr"] >= 1.20:
                     higher_prio1 = [
@@ -250,6 +253,15 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                     if higher_prio1:
                         mid_cands = [full_tp]
                         full_tp = dict(higher_prio1[0])
+
+                # If TP1 sacrificed below 0.80R (e.g. 0.57R on Oct 1 NQ Short),
+                # strictly require BOTH a valid TP2 (>= 0.95R) and FullTP (>= 1.60R)!
+                if tp1_cand["rr"] < self.min_tp1_rr and not mid_cands:
+                    return (
+                        None,
+                        f"TP1 {tp1_cand['target_type']} is < {self.min_tp1_rr:.2f}R ({tp1_cand['rr']:.2f}R) "
+                        f"and no intermediate Priority-1/2 TP2 exists between TP1 and FullTP.",
+                    )
 
                 partial_list: List[Dict[str, Any]] = [
                     {
@@ -274,12 +286,14 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                         "hit": False,
                     })
 
+                if len(partial_list) >= 2 and all(self._target_priority_rank(pt["target_type"]) == 1 for pt in partial_list):
+                    full_tp["priority"] = 1
+                    full_tp["tier"] = 1
+
                 full_tp["partial_targets"] = partial_list
                 return full_tp, ""
 
-            # MULTI-TP PATH B (HOMERUN TRADE >= 3.0R TO CLOSEST PRIORITY-1 POOL, e.g., Oct 6 ES Long to 7892.25 @ 3.79R):
-            # When the closest Priority-1 pool is a homerun target (>= 3.00R), allow intermediate 15m pools
-            # as TP1 (30%) and TP2 (30%) with >= 0.50R spacing between TPs (max 3 TPs total).
+            # MULTI-TP PATH B (HOMERUN TRADE >= 3.0R TO CLOSEST PRIORITY-1 POOL, e.g., Oct 6 ES Long to 7892.00 @ 3.23R):
             if self.enable_partials and 3.00 <= closest_prio1["rr"] <= self.max_rr:
                 full_tp = dict(closest_prio1)
                 intermediate_15m = [
@@ -320,9 +334,10 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 full_tp["partial_targets"] = partial_list
                 return full_tp, ""
 
-        # SINGLE-TP PATH: Closest major target already offers >= 1.65R (e.g., Oct 13 ES @ 2.32R, Oct 14 NQ @ 2.04R)
+        # SINGLE-TP PATH: Closest major target already offers >= 1.60R (e.g., Oct 13 ES @ 2.32R, Oct 14 NQ @ 2.04R)
         valid_candidates = [
-            c for c in all_directional_targets if full_tp_min_rr <= c["rr"] <= self.max_rr
+            c for c in all_directional_targets
+            if c["priority"] <= 2 and full_tp_min_rr <= c["rr"] <= self.max_rr
         ]
         if valid_candidates:
             valid_candidates.sort(key=lambda x: (x["priority"], x["rr"]))
@@ -389,7 +404,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         wanted_struct_dir = "BULLISH" if pos.direction == "LONG" else "BEARISH"
         opposite_struct_dir = "BEARISH" if pos.direction == "LONG" else "BULLISH"
 
-        # 1. Straight-expansion Break-Even protection ONLY on single-TP trades (not Homerun multi-TP trades)
+        # 1. Straight-expansion Break-Even protection ONLY on single-TP trades (when >= 80% toward FullTP)
         has_planned_partials = len(pos.partial_targets) > 0
         if not has_planned_partials and progress_to_full_tp >= 0.80 and abs(pos.stop_loss - pos.initial_stop_loss) < 1e-9:
             if pos.direction == "LONG":
@@ -425,7 +440,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                             f"above {best_be['time'].strftime('%H:%M')} BE swing high @ {best_be['price']:.2f}",
                         )
 
-        # 2. Check if the current 1m bar completed a structure break back in the trade direction
+        # 2. Check if the current 1m bar completed a structure break (or counter-FVG inversion) back in the trade direction
         recent_1m_events = ctx.structure_events_1m[-10:] if ctx.structure_events_1m else []
         cont_event = None
         for ev in reversed(recent_1m_events):
@@ -433,25 +448,61 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 cont_event = ev
                 break
 
+        last_trail_ts = pos.metadata.get("last_trail_event_time", pos.entry_time)
+
+        # Check if a counter-direction 1m FVG formed during a post-entry pullback
+        # was inverted on the current bar (e.g., 09:53 BISI inverted at 09:56 after sweeping 30800.75 on Oct 1)
+        counter_fvg_type = "SIBI" if pos.direction == "LONG" else "BISI"
+        had_counter_fvg_inversion = False
+        if cont_event is None:
+            for rf in getattr(ctx, "recent_fvgs_all", []):
+                if rf.fvg_type == counter_fvg_type and rf.creation_time > last_trail_ts:
+                    for ev_name, ev_ts, _ in rf.events:
+                        if ev_name == "INVERTED" and ev_ts == ctx.timestamp:
+                            cont_event = {
+                                "time": ctx.timestamp,
+                                "close_time": ctx.timestamp,
+                                "kind": "IFVG_BOS",
+                                "direction": wanted_struct_dir,
+                            }
+                            had_counter_fvg_inversion = True
+                            break
+                    if cont_event is not None:
+                        break
+
         if cont_event is None:
             return
 
-        last_trail_ts = pos.metadata.get("last_trail_event_time", pos.entry_time)
         if cont_event["close_time"] <= last_trail_ts:
             return
 
-        # Anchor the pullback search window after the latest partial TP hit (e.g. TP2 at 10:00 on Oct 6)
-        # so `window_df` finds the post-TP2 pullback cluster low (7877.50) rather than the entry bar low!
+        # Only advance `window_anchor_ts` to TP2's timestamp if TP2 occurred at least 2 minutes BEFORE
+        # the current bar (so a TP2 hit on the same bar as `cont_event` never wipes out the pullback window)
         window_anchor_ts = last_trail_ts
-        if pos.partial_exits:
-            last_partial_ts = pos.partial_exits[-1]["time"]
-            if last_partial_ts > window_anchor_ts:
-                window_anchor_ts = last_partial_ts
+        prior_tp2_exits = [
+            pe for pe in pos.partial_exits
+            if pe.get("label") == "TP2" and pe["time"] <= (ctx.timestamp - pd.Timedelta(minutes=2))
+        ]
+        if prior_tp2_exits:
+            last_tp2_ts = prior_tp2_exits[-1]["time"]
+            if last_tp2_ts > window_anchor_ts:
+                window_anchor_ts = last_tp2_ts
 
         had_counter_bos = any(
             e["direction"] == opposite_struct_dir and window_anchor_ts < e["close_time"] < cont_event["close_time"]
             for e in recent_1m_events
         )
+
+        fvg_type_needed = "BISI" if pos.direction == "LONG" else "SIBI"
+        had_fvg_inversion = False
+        for rf in getattr(ctx, "recent_fvgs_all", []):
+            if rf.fvg_type == fvg_type_needed and rf.creation_time >= (pos.entry_time - pd.Timedelta(minutes=2)):
+                for ev_name, ev_ts, _ in rf.events:
+                    if ev_name == "INVERTED" and window_anchor_ts < ev_ts < cont_event["close_time"]:
+                        had_fvg_inversion = True
+                        break
+                if had_fvg_inversion:
+                    break
 
         window_df = ctx.history_df[ctx.history_df.index > window_anchor_ts]
         if len(window_df) < 2:
@@ -466,7 +517,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
             ]
             swept_cluster = sum(1 for s in prior_swings if pullback_low < float(s["price"])) >= 1
             cluster_touches = int((window_df["low"] <= (pullback_low + buffer_pts)).sum())
-            if not (had_counter_bos or swept_cluster or (tp2_hit and cluster_touches >= 2)):
+            if not (had_counter_bos or had_fvg_inversion or had_counter_fvg_inversion or swept_cluster or (tp2_hit and cluster_touches >= 2)):
                 return
 
             raw_new_sl = pullback_low if (tp2_hit and cluster_touches >= 2) else (pullback_low - buffer_pts)
@@ -497,7 +548,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
             ]
             swept_cluster = sum(1 for s in prior_swings if pullback_high > float(s["price"])) >= 1
             cluster_touches = int((window_df["high"] >= (pullback_high - buffer_pts)).sum())
-            if not (had_counter_bos or swept_cluster or (tp2_hit and cluster_touches >= 2)):
+            if not (had_counter_bos or had_fvg_inversion or had_counter_fvg_inversion or swept_cluster or (tp2_hit and cluster_touches >= 2)):
                 return
 
             raw_new_sl = pullback_high if (tp2_hit and cluster_touches >= 2) else (pullback_high + buffer_pts)
@@ -548,7 +599,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
             if direction == "SHORT" and ctx.close > ctx.open:
                 return False, "NONE", "", 0, [], trigger_desc, "1m follow-through bar closed bullish against Short trigger."
 
-        # Block counter-trend Bearish SMT shorts when in ATH + Dual-Index All-HTF-Bullish regime (e.g., Oct 6 10:03 ES Short)
+        # Block counter-trend Bearish SMT shorts when in ATH + Dual-Index HTF-Bullish regime (e.g., Oct 6 10:03 ES Short)
         if direction == "SHORT" and is_ath_bullish_regime:
             return (
                 False,
@@ -557,7 +608,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 0,
                 [],
                 trigger_desc,
-                "ATH + Dual-Index All-HTF-Bullish Regime active (ES & NQ 4H/1H/15m/5m BULLISH): Counter-trend Bearish SMT shorts are forbidden at ATH.",
+                "ATH + Dual-Index HTF-Bullish Regime active (ES & NQ 4H/1H/15m BULLISH): Counter-trend Bearish SMT shorts are forbidden at ATH.",
             )
 
         # MODEL 2: Counter-5m Intraday Post-Open SMT Reversal
@@ -673,8 +724,6 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
             if e["direction"] == opposite_struct_dir and e["close_time"] < confirm_event["close_time"]
         ]
 
-        # Also check if a recent 1m same-direction FVG (e.g. the 09:40 BISI [7866.25-7867.00] on Oct 6)
-        # was inverted during the last 8 minutes prior to `confirm_event`!
         inverted_1m_fvg_desc = ""
         for rf in getattr(ctx, "recent_fvgs_all", []):
             if rf.fvg_type == fvg_type_needed:
@@ -684,6 +733,28 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                             f"1m {rf.fvg_type} [{rf.bottom:.2f}-{rf.top:.2f}] inverted at {ev_ts.strftime('%H:%M')}"
                         )
                         break
+
+        if direction == "LONG" and is_ath_bullish_regime and ctx.liquidity_taken_level in ("MEDIUM", "HIGH"):
+            if has_intraday_post_open_smt and (counter_events or inverted_1m_fvg_desc):
+                retrace_label = (
+                    inverted_1m_fvg_desc
+                    if inverted_1m_fvg_desc
+                    else f"1m Counter-{counter_events[-1]['kind']} at {counter_events[-1]['close_time'].strftime('%H:%M')}"
+                )
+                detail = (
+                    f"ATH + Dual-Index HTF-Bullish Regime: {retrace_label} "
+                    f"+ Confirmed 1m Bullish SMT + {trigger_desc}"
+                )
+                return True, "ATH_SMT_CONTINUATION", detail, 3, [], trigger_desc, ""
+            return (
+                False,
+                "NONE",
+                "",
+                0,
+                [],
+                trigger_desc,
+                "ATH regime with London BSL already swept requires 1m FVG inversion/counter-break + confirmed 1m Bullish SMT.",
+            )
 
         if touched_5m_fvgs and in_favorable_eq:
             detail = f"{fvg_5m_strs[0]} + {eq_detail_str}"
@@ -695,9 +766,6 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         if in_ote:
             return True, "5M_OTE_RETRACE", ote_detail_str, 2, [], trigger_desc, ""
 
-        # ATH + Dual-Index All-HTF-Bullish Continuation Exception (Oct 6 09:46 ES Long):
-        # When NQ is at ATH and BOTH indices are BULLISH across 4H/1H/15m/5m, a 1m counter-break
-        # or 1m FVG inversion paired with an active intraday Bullish SMT is a full 3-point trigger!
         if direction == "LONG" and is_ath_bullish_regime and has_intraday_post_open_smt and (counter_events or inverted_1m_fvg_desc):
             retrace_label = (
                 inverted_1m_fvg_desc
@@ -705,7 +773,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 else f"1m Counter-{counter_events[-1]['kind']} at {counter_events[-1]['close_time'].strftime('%H:%M')}"
             )
             detail = (
-                f"ATH + Dual-Index All-HTF-Bullish Regime: {retrace_label} "
+                f"ATH + Dual-Index HTF-Bullish Regime: {retrace_label} "
                 f"+ Confirmed 1m Bullish SMT + {trigger_desc}"
             )
             return True, "ATH_SMT_CONTINUATION", detail, 3, [], trigger_desc, ""
@@ -732,11 +800,18 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         matching_fvgs: List[FairValueGap],
         tick_size: float,
         retrace_type: str = "",
+        retrace_pts: int = 1,
     ) -> Tuple[Optional[float], float, str]:
         price = ctx.close
         buffer_pts = 2 * tick_size  # 0.50 pt buffer on ES/NQ
         min_sl = 2.0 if ctx.symbol == "ES" else 8.0
-        max_valid_sl = self.stop_loss_points * 1.6
+
+        # Allow structural Stop-Losses up to 102.0 pts on NQ whenever backed by a 3-point
+        # 5m FVG/EQ or SMT entry model (regardless of whether liquidity exhaustion is LOW, MEDIUM, or HIGH).
+        if ctx.symbol == "NQ" and retrace_pts >= 3:
+            max_valid_sl = max(self.stop_loss_points * 1.6, 102.0)
+        else:
+            max_valid_sl = self.stop_loss_points * 1.6
 
         if self.sl_mode == "wide_5m" and ctx.confirmed_swings_5m:
             if direction == "LONG":
@@ -763,9 +838,13 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                     )
 
         use_tight_smt_peak = (retrace_type == "SMT_REVERSAL_MODEL" and ctx.symbol == "ES")
-        use_exact_cluster_low = (retrace_type == "ATH_SMT_CONTINUATION" and ctx.symbol == "ES")
-        lookback_bars = 5 if use_tight_smt_peak else (7 if use_exact_cluster_low else 8)
-        swing_age_min = 5 if use_tight_smt_peak else (7 if use_exact_cluster_low else 12)
+        use_exact_cluster_low = (
+            ctx.symbol == "ES"
+            and direction == "LONG"
+            and retrace_type == "ATH_SMT_CONTINUATION"
+        )
+        lookback_bars = 5 if use_tight_smt_peak else 8
+        swing_age_min = 5 if use_tight_smt_peak else 12
         swing_slice = 4
 
         pullback_bars = ctx.history_df.iloc[-lookback_bars:]
@@ -824,6 +903,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         has_structural_sweep: bool,
         htf_trends: Dict[str, str],
         liquidity_taken_level: str,
+        has_cross_index_htf_smt_alignment: bool = False,
     ) -> Tuple[str, int, List[str], List[str]]:
         score = 0
         pros: List[str] = []
@@ -872,6 +952,9 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         if aligned_count >= 2 or neutral_count == 3:
             score += 2
             pros.append(f"HTF Structure Aligned (4H={t_4h}, 1H={t_1h}, 15m={t_15m})")
+        elif aligned_count == 1 and has_cross_index_htf_smt_alignment:
+            score += 2
+            pros.append(f"HTF Structure Aligned via Confirmed 1H/4H SMT & Companion HTF MSS (4H={t_4h}, 1H={t_1h}, 15m={t_15m})")
         elif aligned_count == 1:
             score += 1
             cons.append(f"Mixed HTF Structure (4H={t_4h}, 1H={t_1h}, 15m={t_15m})")
@@ -1004,6 +1087,9 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         intraday_bull_smt = any(bool(ev.get("is_intraday_post_open", False)) for ev in bull_smts)
         intraday_bear_smt = any(bool(ev.get("is_intraday_post_open", False)) for ev in bear_smts)
 
+        has_htf_bull_smt = any(str(ev.get("timeframe", "")) in ("1h", "4h") for ev in bull_smts)
+        has_htf_bear_smt = any(str(ev.get("timeframe", "")) in ("1h", "4h") for ev in bear_smts)
+
         has_5m_and_1m_bull_smt = (
             any(str(ev.get("timeframe", "")).startswith("5m") for ev in bull_smts)
             and any(str(ev.get("timeframe", "")).startswith("1m") for ev in bull_smts)
@@ -1021,27 +1107,37 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         sec_4h = ctx.sec_htf_trends.get("4h", t_4h)
         sec_1h = ctx.sec_htf_trends.get("1h", t_1h)
         sec_15m = ctx.sec_htf_trends.get("15min", t_15m)
-        sec_5m = ctx.sec_htf_trends.get("5min", trend_5m)
 
-        # ATH Regime: Requires NQ/ES testing ATH AND BOTH indices showing BULLISH orderflow
-        # across 4H, 1H, 15m, and 5m (no pre-open HTF retrace/reversal on either index).
         is_ath_bullish_regime = (
             ctx.htf_trends.get("ath_regime") == "ACTIVE"
             and t_4h == "BULLISH"
             and t_1h == "BULLISH"
             and t_15m == "BULLISH"
-            and trend_5m == "BULLISH"
             and sec_4h == "BULLISH"
             and sec_1h == "BULLISH"
             and sec_15m == "BULLISH"
-            and sec_5m == "BULLISH"
         )
 
         all_active_smt_descriptions = [ev["description"] for ev in ctx.recent_smt_events]
 
+        ny_open_ts = ctx.timestamp.replace(hour=9, minute=30, second=0, microsecond=0)
+        rth_df = ctx.history_df[ctx.history_df.index >= ny_open_ts]
+        rth_high = float(rth_df["high"].max()) if not rth_df.empty else price
+        rth_low = float(rth_df["low"].min()) if not rth_df.empty else price
+        rth_range = rth_high - rth_low
+        max_exhaustion_leg_pts = 18.0 if ctx.symbol == "ES" else 150.0
+
         for direction in ("LONG", "SHORT"):
             wanted_bias = "BULLISH" if direction == "LONG" else "BEARISH"
             htf_aligned_count = sum(1 for b in (t_4h, t_1h, t_15m) if b == wanted_bias)
+            sec_htf_aligned_count = sum(1 for b in (sec_4h, sec_1h, sec_15m) if b == wanted_bias)
+            has_dir_htf_smt = has_htf_bull_smt if direction == "LONG" else has_htf_bear_smt
+            has_cross_index_htf_smt_alignment = (
+                htf_aligned_count >= 1
+                and sec_htf_aligned_count >= 2
+                and has_dir_htf_smt
+            )
+
             is_synthetic_short_df = len(ctx.history_df) < 25
             dir_exhaustion = ctx.liquidity_taken_by_dir.get(direction, ctx.liquidity_taken_level)
             dir_taken_pools = ctx.session_taken_by_dir.get(direction, ctx.session_taken_pools)
@@ -1082,14 +1178,43 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 )
                 continue
 
+            # Overextended Exhaustion-Leg Filter (e.g., Oct 16 10:26 NQ Short):
+            if dir_exhaustion == "HIGH" and not is_synthetic_short_df:
+                if direction == "SHORT":
+                    dist_below_high = rth_high - price
+                    if rth_range >= max_exhaustion_leg_pts and dist_below_high >= (max_exhaustion_leg_pts * 0.75):
+                        self._log_diagnostic(
+                            date_str,
+                            f"[{t_hm}] SHORT ({trigger_desc}, {retrace_type}) -> Rejected: HIGH liquidity exhaustion "
+                            f"+ large downside expansion leg already completed ({rth_range:.2f} pts drop from RTH high {rth_high:.2f}; "
+                            f"currently {dist_below_high:.2f} pts below high).",
+                        )
+                        continue
+                else:
+                    dist_above_low = price - rth_low
+                    if rth_range >= max_exhaustion_leg_pts and dist_above_low >= (max_exhaustion_leg_pts * 0.75):
+                        self._log_diagnostic(
+                            date_str,
+                            f"[{t_hm}] LONG ({trigger_desc}, {retrace_type}) -> Rejected: HIGH liquidity exhaustion "
+                            f"+ large upside expansion leg already completed ({rth_range:.2f} pts rally from RTH low {rth_low:.2f}; "
+                            f"currently {dist_above_low:.2f} pts above low).",
+                        )
+                        continue
+
             raw_sl_dist, true_struct_dist, sl_anchor_str = self._compute_stop_loss(
-                ctx, direction, matching_fvgs, tick_size, retrace_type=retrace_type
+                ctx,
+                direction,
+                matching_fvgs,
+                tick_size,
+                retrace_type=retrace_type,
+                retrace_pts=retrace_pts,
             )
             if raw_sl_dist is None:
+                eff_max_sl = max(self.stop_loss_points * 1.6, 102.0) if (ctx.symbol == "NQ" and retrace_pts >= 3) else (self.stop_loss_points * 1.6)
                 self._log_diagnostic(
                     date_str,
                     f"[{t_hm}] {direction} ({trigger_desc}, {retrace_type}) -> Rejected: True structural Stop-Loss "
-                    f"({true_struct_dist:.2f} pts, {sl_anchor_str}) exceeds max valid SL ({self.stop_loss_points * 1.6:.2f} pts).",
+                    f"({true_struct_dist:.2f} pts, {sl_anchor_str}) exceeds max valid SL ({eff_max_sl:.2f} pts).",
                 )
                 continue
 
@@ -1099,8 +1224,12 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
 
             allow_exception_tp1 = (
                 retrace_pts >= 3
-                and dir_exhaustion != "HIGH"
-                and (htf_aligned_count >= 2 or (bullish_smt if direction == "LONG" else bearish_smt))
+                and dir_exhaustion in ("LOW", "MEDIUM")
+                and (
+                    htf_aligned_count >= 2
+                    or has_cross_index_htf_smt_alignment
+                    or (bullish_smt if direction == "LONG" else bearish_smt)
+                )
             )
 
             target_info, target_fail_reason = self._select_best_target(
@@ -1129,6 +1258,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 has_structural_sweep=(ssl_swept if direction == "LONG" else bsl_swept),
                 htf_trends=ctx.htf_trends,
                 liquidity_taken_level=dir_exhaustion,
+                has_cross_index_htf_smt_alignment=has_cross_index_htf_smt_alignment,
             )
 
             partial_targets = target_info.get("partial_targets", [])

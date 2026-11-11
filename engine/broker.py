@@ -23,8 +23,9 @@ class Order:
 
 class SimulatedBroker:
     """
-    Executes Market and Limit orders and monitors intrabar Stop-Loss (SL)
-    and Take-Profit (TP) levels with strict Zero Look-Ahead protection.
+    Executes Market and Limit orders and monitors intrabar Stop-Loss (SL),
+    Partial Take-Profits (TP1, TP2), and Final Take-Profit (FullTP) levels
+    with strict Zero Look-Ahead protection.
     """
 
     def __init__(
@@ -65,20 +66,12 @@ class SimulatedBroker:
         current_close: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[Order]:
-        """
-        Submits a new order.
-        - If order_type == 'MARKET' and current_close is provided, fills immediately
-          at current_close (with slippage) on the closed bar.
-        - If order_type == 'LIMIT' (or MARKET without current_close), queues in
-          pending_orders to be evaluated on subsequent candles.
-        """
         direction = direction.upper()
         order_type = order_type.upper()
 
         if self.portfolio.has_open_position(symbol):
             return None
 
-        # Validate SL/TP geometry before accepting order
         ref_price = limit_price if order_type == "LIMIT" and limit_price is not None else current_close
         if ref_price is not None:
             if direction == "LONG" and not (stop_loss < ref_price < take_profit):
@@ -151,15 +144,9 @@ class SimulatedBroker:
         low_p: float,
         close_p: float,
     ) -> List[TradeRecord]:
-        """
-        Evaluates a new OHLC candle for a given symbol:
-        1. Checks existing open positions (entered strictly before `timestamp`)
-           for Stop-Loss and Take-Profit hits, using conservative SL priority.
-        2. Evaluates pending Market/Limit orders created strictly before `timestamp`.
-        """
         closed_this_bar: List[TradeRecord] = []
 
-        # Check SL / TP on existing open position
+        # Check SL / Partials / FullTP on existing open position
         if self.portfolio.has_open_position(symbol):
             pos = self.portfolio.positions[symbol]
             if timestamp > pos.entry_time:
@@ -183,7 +170,6 @@ class SimulatedBroker:
                     entry_side = "BUY" if order.direction == "LONG" else "SELL"
                     fill_price = self._apply_slippage(symbol, open_p, entry_side)
                     pos = self._fill_order(order, fill_price, timestamp)
-                    # Check if the same bar immediately stops out the new position
                     trade = self._check_position_exit(pos, timestamp, open_p, high_p, low_p)
                     if trade is not None:
                         closed_this_bar.append(trade)
@@ -217,23 +203,39 @@ class SimulatedBroker:
         low_p: float,
     ) -> Optional[TradeRecord]:
         """
-        Checks if a candle triggers Stop-Loss or Take-Profit.
-        Enforces conservative intrabar execution: if both SL and TP are touched
-        within the same 1-minute candle, Stop-Loss takes priority.
+        Checks if a candle triggers Stop-Loss, Partial Take-Profits (TP1/TP2), or Full Take-Profit.
+        Enforces conservative intrabar execution: if SL and TP are touched within the same
+        1-minute candle, Stop-Loss takes priority on the currently open fraction.
         """
         symbol = pos.symbol
 
         if pos.direction == "LONG":
             sl_hit = low_p <= pos.stop_loss
-            tp_hit = high_p >= pos.take_profit
-
             if sl_hit:
-                # If candle opens below SL, fill at open_p (gap slippage); else at SL
                 base_exit = min(open_p, pos.stop_loss)
                 exit_price = self._apply_slippage(symbol, base_exit, "SELL")
                 return self.portfolio.close_position(
                     symbol, exit_price, timestamp, "STOP_LOSS", self.commission_per_contract
                 )
+
+            # Evaluate intermediate partial targets (TP1, TP2)
+            for pt in pos.partial_targets:
+                if not pt.get("hit", False) and high_p >= float(pt["price"]):
+                    pt_fill = max(open_p, float(pt["price"]))
+                    pt["hit"] = True
+                    pt["hit_time"] = timestamp
+                    pt["hit_price"] = pt_fill
+                    self.portfolio.record_partial_exit(
+                        symbol=symbol,
+                        exit_price=pt_fill,
+                        weight=float(pt.get("weight", 0.30)),
+                        timestamp=timestamp,
+                        label=str(pt.get("label", "TP1")),
+                        target_type=str(pt.get("target_type", "")),
+                        commission_per_side=self.commission_per_contract,
+                    )
+
+            tp_hit = high_p >= pos.take_profit
             if tp_hit:
                 exit_price = max(open_p, pos.take_profit)
                 return self.portfolio.close_position(
@@ -242,15 +244,31 @@ class SimulatedBroker:
 
         elif pos.direction == "SHORT":
             sl_hit = high_p >= pos.stop_loss
-            tp_hit = low_p <= pos.take_profit
-
             if sl_hit:
-                # If candle opens above SL, fill at open_p (gap slippage); else at SL
                 base_exit = max(open_p, pos.stop_loss)
                 exit_price = self._apply_slippage(symbol, base_exit, "BUY")
                 return self.portfolio.close_position(
                     symbol, exit_price, timestamp, "STOP_LOSS", self.commission_per_contract
                 )
+
+            # Evaluate intermediate partial targets (TP1, TP2)
+            for pt in pos.partial_targets:
+                if not pt.get("hit", False) and low_p <= float(pt["price"]):
+                    pt_fill = min(open_p, float(pt["price"]))
+                    pt["hit"] = True
+                    pt["hit_time"] = timestamp
+                    pt["hit_price"] = pt_fill
+                    self.portfolio.record_partial_exit(
+                        symbol=symbol,
+                        exit_price=pt_fill,
+                        weight=float(pt.get("weight", 0.30)),
+                        timestamp=timestamp,
+                        label=str(pt.get("label", "TP1")),
+                        target_type=str(pt.get("target_type", "")),
+                        commission_per_side=self.commission_per_contract,
+                    )
+
+            tp_hit = low_p <= pos.take_profit
             if tp_hit:
                 exit_price = min(open_p, pos.take_profit)
                 return self.portfolio.close_position(
