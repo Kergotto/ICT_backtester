@@ -990,15 +990,69 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
 
         return grade, score, pros, cons
 
-    def _calculate_contracts(self, portfolio: Portfolio, symbol: str, actual_risk_pts: float) -> int:
+    def _calculate_contracts(self, portfolio: Portfolio, symbol: str, actual_risk_pts: float) -> Tuple[ float, str ]:
+        """
+        Targets ~$900-$1,000 risk and NEVER exceeds $1,100 risk.
+        1. Tries whole standard contracts (ES / NQ) first:
+           - If `low_lots` risk is > $800 (and <= $1,000), uses `low_lots` (or `high_lots` if <= $1,100 and closer to $1,000).
+           - If `low_lots` risk is too low (<= $800), raises to `high_lots` ONLY if `high_lots` risk <= $1,100.
+        2. If standard contracts cannot land in ($800, $1,100] (e.g., 1 NQ > $1,100 on Oct 1, or 2 ES = $750 / 3 ES = $1,125 on Oct 6),
+           automatically switches to Micro contracts (MNQ / MES, where 1 Micro = 0.1 Standard contract) to size right around ~$1,000!
+        """
+        clean_sym = symbol.upper()
         if not self.use_dynamic_sizing or actual_risk_pts <= 0:
-            return self.quantity
-        risk_dollars = portfolio.cash * self.risk_per_trade_pct
-        dollar_risk_per_contract = actual_risk_pts * portfolio.get_point_value(symbol)
-        if dollar_risk_per_contract <= 0:
-            return self.quantity
-        contracts = int(round(risk_dollars / dollar_risk_per_contract))
-        return max(1, contracts)
+            return float(self.quantity), f"{self.quantity} {clean_sym}"
+
+        target_risk = self.initial_target_risk if hasattr(self, "initial_target_risk") else (100_000.0 * self.risk_per_trade_pct)
+        min_acceptable_risk = target_risk * 0.80  # $800.00
+        max_acceptable_risk = target_risk * 1.10  # $1,100.00
+
+        std_point_val = portfolio.get_point_value(clean_sym)
+        std_unit_risk = actual_risk_pts * std_point_val
+        if std_unit_risk <= 0:
+            return float(self.quantity), f"{self.quantity} {clean_sym}"
+
+        low_std = int(target_risk // std_unit_risk)
+        high_std = low_std + 1
+
+        low_std_risk = low_std * std_unit_risk
+        high_std_risk = high_std * std_unit_risk
+
+        chosen_std: Optional[int] = None
+        if low_std >= 1 and low_std_risk > min_acceptable_risk:
+            if high_std_risk <= max_acceptable_risk and abs(high_std_risk - target_risk) < abs(low_std_risk - target_risk):
+                chosen_std = high_std
+            else:
+                chosen_std = low_std
+        elif high_std >= 1 and high_std_risk <= max_acceptable_risk and high_std_risk > min_acceptable_risk:
+            chosen_std = high_std
+
+        if chosen_std is not None:
+            return float(chosen_std), f"{chosen_std} {clean_sym}"
+
+        # Fallback to Micro contracts (MES = 0.1 ES, MNQ = 0.1 NQ)
+        micro_sym = f"M{clean_sym}" if not clean_sym.startswith("M") else clean_sym
+        micro_unit_risk = std_unit_risk * 0.10
+
+        low_micro = int(target_risk // micro_unit_risk)
+        high_micro = low_micro + 1
+
+        low_micro_risk = low_micro * micro_unit_risk
+        high_micro_risk = high_micro * micro_unit_risk
+
+        if low_micro >= 1 and low_micro_risk > min_acceptable_risk:
+            if high_micro_risk <= max_acceptable_risk and abs(high_micro_risk - target_risk) < abs(low_micro_risk - target_risk):
+                chosen_micro = high_micro
+            else:
+                chosen_micro = low_micro
+        elif high_micro_risk <= max_acceptable_risk:
+            chosen_micro = max(1, high_micro)
+        else:
+            chosen_micro = max(1, low_micro)
+
+        # 1 Micro contract = 0.1 Standard contract equivalent for PnL math
+        std_equiv_qty = round(chosen_micro * 0.10, 2)
+        return std_equiv_qty, f"{chosen_micro} {micro_sym}"
 
     def on_bar(
         self,
@@ -1306,7 +1360,8 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 continue
 
             tp_price = target_info["price"]
-            contracts = self._calculate_contracts(portfolio, ctx.symbol, actual_risk_pts)
+            contracts, display_qty_str = self._calculate_contracts(portfolio, ctx.symbol, actual_risk_pts)
+            setup_metadata["display_qty"] = display_qty_str
 
             broker.submit_order(
                 symbol=ctx.symbol,

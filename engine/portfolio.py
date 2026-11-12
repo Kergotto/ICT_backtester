@@ -17,7 +17,7 @@ class Position:
     symbol: str
     direction: str  # 'LONG' or 'SHORT'
     entry_price: float
-    quantity: int
+    quantity: float
     stop_loss: float
     take_profit: float
     entry_time: pd.Timestamp
@@ -71,7 +71,7 @@ class TradeRecord:
     exit_time: pd.Timestamp
     entry_price: float
     exit_price: float
-    quantity: int
+    quantity: float
     stop_loss: float
     take_profit: float
     exit_reason: str  # 'STOP_LOSS', 'TAKE_PROFIT', 'BE_TRAILED_SL', 'SIGNAL_EXIT', 'END_OF_DATA'
@@ -118,7 +118,7 @@ class Portfolio:
         symbol: str,
         direction: str,
         entry_price: float,
-        quantity: int,
+        quantity: float,
         stop_loss: float,
         take_profit: float,
         timestamp: pd.Timestamp,
@@ -128,11 +128,12 @@ class Portfolio:
         if symbol in self.positions:
             raise ValueError(f"Position already open for symbol {symbol}.")
 
+        eff_qty = int(quantity) if float(quantity).is_integer() else round(float(quantity), 2)
         pos = Position(
             symbol=symbol,
             direction=direction.upper(),
             entry_price=float(entry_price),
-            quantity=int(quantity),
+            quantity=eff_qty,
             stop_loss=float(stop_loss),
             take_profit=float(take_profit),
             entry_time=timestamp,
@@ -239,7 +240,7 @@ class Portfolio:
 
         if effective_exit_reason == "BE_TRAILED_SL":
             meta["outcome"] = "BE"
-        elif net_pnl > 0:
+        elif net_pnl > 0 or exit_reason == "TAKE_PROFIT":
             meta["outcome"] = "WIN"
         else:
             meta["outcome"] = "LOSS"

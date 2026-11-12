@@ -6,26 +6,22 @@ from engine.portfolio import Portfolio, Position, TradeRecord
 
 @dataclass
 class Order:
-    order_id: int
     symbol: str
     direction: str  # 'LONG' or 'SHORT'
-    order_type: str  # 'MARKET' or 'LIMIT'
-    quantity: int
+    order_type: str  # 'MARKET', 'LIMIT', 'STOP'
+    quantity: float
+    timestamp: pd.Timestamp
     stop_loss: float
     take_profit: float
-    created_time: pd.Timestamp
     limit_price: Optional[float] = None
-    status: str = "PENDING"  # 'PENDING', 'FILLED', 'CANCELLED'
-    filled_time: Optional[pd.Timestamp] = None
-    filled_price: Optional[float] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class SimulatedBroker:
     """
-    Executes Market and Limit orders and monitors intrabar Stop-Loss (SL),
-    Partial Take-Profits (TP1, TP2), and Final Take-Profit (FullTP) levels
-    with strict Zero Look-Ahead protection.
+    Executes market/limit orders with realistic slippage and commissions,
+    and processes intrabar Stop-Loss, multi-stage Partial Take-Profits (TP1/TP2),
+    and Full Take-Profit fills on every 1-minute candle.
     """
 
     def __init__(
@@ -38,102 +34,57 @@ class SimulatedBroker:
         self.commission_per_contract = float(commission_per_contract)
         self.slippage_ticks = int(slippage_ticks)
         self.pending_orders: List[Order] = []
-        self.order_history: List[Order] = []
-        self._next_order_id: int = 1
-
-    def _apply_slippage(self, symbol: str, price: float, side: str) -> float:
-        """
-        Applies adverse slippage on market and stop executions:
-        - Buying ('BUY') fills slightly higher.
-        - Selling ('SELL') fills slightly lower.
-        """
-        tick_size = self.portfolio.get_tick_size(symbol)
-        slip = self.slippage_ticks * tick_size
-        if side.upper() == "BUY":
-            return float(price + slip)
-        return float(price - slip)
 
     def submit_order(
         self,
         symbol: str,
         direction: str,
         order_type: str,
-        quantity: int,
+        quantity: float,
         stop_loss: float,
         take_profit: float,
         timestamp: pd.Timestamp,
+        current_close: float,
         limit_price: Optional[float] = None,
-        current_close: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Order]:
-        direction = direction.upper()
-        order_type = order_type.upper()
-
-        if self.portfolio.has_open_position(symbol):
+    ) -> Optional[Position]:
+        clean_dir = direction.upper()
+        clean_type = order_type.upper()
+        qty = float(quantity)
+        if qty <= 0:
             return None
 
-        ref_price = limit_price if order_type == "LIMIT" and limit_price is not None else current_close
-        if ref_price is not None:
-            if direction == "LONG" and not (stop_loss < ref_price < take_profit):
-                raise ValueError(
-                    f"Invalid LONG bracket: stop_loss ({stop_loss}) must be < entry ({ref_price}) < take_profit ({take_profit})."
-                )
-            if direction == "SHORT" and not (take_profit < ref_price < stop_loss):
-                raise ValueError(
-                    f"Invalid SHORT bracket: take_profit ({take_profit}) must be < entry ({ref_price}) < stop_loss ({stop_loss})."
-                )
+        tick_size = self.portfolio.get_tick_size(symbol)
+        slip_pts = self.slippage_ticks * tick_size
+
+        if clean_type == "MARKET":
+            fill_price = current_close + slip_pts if clean_dir == "LONG" else current_close - slip_pts
+            entry_comm = self.commission_per_contract * qty
+            return self.portfolio.open_position(
+                symbol=symbol,
+                direction=clean_dir,
+                entry_price=fill_price,
+                quantity=qty,
+                stop_loss=float(stop_loss),
+                take_profit=float(take_profit),
+                timestamp=timestamp,
+                commission=entry_comm,
+                metadata=metadata or {},
+            )
 
         order = Order(
-            order_id=self._next_order_id,
             symbol=symbol,
-            direction=direction,
-            order_type=order_type,
-            quantity=int(quantity),
+            direction=clean_dir,
+            order_type=clean_type,
+            quantity=qty,
+            timestamp=timestamp,
             stop_loss=float(stop_loss),
             take_profit=float(take_profit),
-            created_time=timestamp,
             limit_price=float(limit_price) if limit_price is not None else None,
             metadata=metadata or {},
         )
-        self._next_order_id += 1
-
-        if order_type == "MARKET" and current_close is not None:
-            entry_side = "BUY" if direction == "LONG" else "SELL"
-            fill_price = self._apply_slippage(symbol, current_close, entry_side)
-            self._fill_order(order, fill_price, timestamp)
-            return order
-
         self.pending_orders.append(order)
-        return order
-
-    def _fill_order(self, order: Order, fill_price: float, timestamp: pd.Timestamp) -> Position:
-        order.status = "FILLED"
-        order.filled_price = float(fill_price)
-        order.filled_time = timestamp
-        self.order_history.append(order)
-
-        entry_commission = self.commission_per_contract * order.quantity
-        return self.portfolio.open_position(
-            symbol=order.symbol,
-            direction=order.direction,
-            entry_price=fill_price,
-            quantity=order.quantity,
-            stop_loss=order.stop_loss,
-            take_profit=order.take_profit,
-            timestamp=timestamp,
-            commission=entry_commission,
-            metadata=order.metadata,
-        )
-
-    def cancel_pending_orders(self, symbol: Optional[str] = None) -> None:
-        remaining = []
-        for order in self.pending_orders:
-            if symbol is None or order.symbol == symbol:
-                order.status = "CANCELLED"
-                self.order_history.append(order)
-            else:
-                remaining.append(order)
-        self.pending_orders = remaining
+        return None
 
     def process_candle(
         self,
@@ -144,135 +95,129 @@ class SimulatedBroker:
         low_p: float,
         close_p: float,
     ) -> List[TradeRecord]:
-        closed_this_bar: List[TradeRecord] = []
+        closed_trades: List[TradeRecord] = []
+        tick_size = self.portfolio.get_tick_size(symbol)
+        slip_pts = self.slippage_ticks * tick_size
 
-        # Check SL / Partials / FullTP on existing open position
-        if self.portfolio.has_open_position(symbol):
-            pos = self.portfolio.positions[symbol]
-            if timestamp > pos.entry_time:
-                trade = self._check_position_exit(pos, timestamp, open_p, high_p, low_p)
-                if trade is not None:
-                    closed_this_bar.append(trade)
-
-        # Check pending orders if no position is currently open for this symbol
-        if not self.portfolio.has_open_position(symbol) and self.pending_orders:
-            still_pending: List[Order] = []
+        # 1. Process any pending limit/stop entry orders
+        if self.pending_orders and not self.portfolio.has_open_position(symbol):
+            remaining_orders: List[Order] = []
             for order in self.pending_orders:
-                if order.symbol != symbol or timestamp <= order.created_time:
-                    still_pending.append(order)
+                if order.symbol != symbol:
+                    remaining_orders.append(order)
                     continue
-
-                if self.portfolio.has_open_position(symbol):
-                    still_pending.append(order)
-                    continue
-
-                if order.order_type == "MARKET":
-                    entry_side = "BUY" if order.direction == "LONG" else "SELL"
-                    fill_price = self._apply_slippage(symbol, open_p, entry_side)
-                    pos = self._fill_order(order, fill_price, timestamp)
-                    trade = self._check_position_exit(pos, timestamp, open_p, high_p, low_p)
-                    if trade is not None:
-                        closed_this_bar.append(trade)
-
-                elif order.order_type == "LIMIT" and order.limit_price is not None:
+                filled = False
+                fill_price = 0.0
+                if order.order_type == "LIMIT" and order.limit_price is not None:
                     if order.direction == "LONG" and low_p <= order.limit_price:
-                        fill_price = float(min(open_p, order.limit_price))
-                        pos = self._fill_order(order, fill_price, timestamp)
-                        trade = self._check_position_exit(pos, timestamp, open_p, high_p, low_p)
-                        if trade is not None:
-                            closed_this_bar.append(trade)
+                        fill_price = min(open_p, order.limit_price)
+                        filled = True
                     elif order.direction == "SHORT" and high_p >= order.limit_price:
-                        fill_price = float(max(open_p, order.limit_price))
-                        pos = self._fill_order(order, fill_price, timestamp)
-                        trade = self._check_position_exit(pos, timestamp, open_p, high_p, low_p)
-                        if trade is not None:
-                            closed_this_bar.append(trade)
-                    else:
-                        still_pending.append(order)
+                        fill_price = max(open_p, order.limit_price)
+                        filled = True
+                if filled and not self.portfolio.has_open_position(symbol):
+                    entry_comm = self.commission_per_contract * order.quantity
+                    self.portfolio.open_position(
+                        symbol=order.symbol,
+                        direction=order.direction,
+                        entry_price=fill_price,
+                        quantity=order.quantity,
+                        stop_loss=order.stop_loss,
+                        take_profit=order.take_profit,
+                        timestamp=timestamp,
+                        commission=entry_comm,
+                        metadata=order.metadata,
+                    )
+                else:
+                    remaining_orders.append(order)
+            self.pending_orders = remaining_orders
 
-            self.pending_orders = still_pending
+        # 2. Process open position Stop-Loss, Partial TPs (TP1 / TP2), and Full Take-Profit
+        if not self.portfolio.has_open_position(symbol):
+            return closed_trades
 
-        return closed_this_bar
-
-    def _check_position_exit(
-        self,
-        pos: Position,
-        timestamp: pd.Timestamp,
-        open_p: float,
-        high_p: float,
-        low_p: float,
-    ) -> Optional[TradeRecord]:
-        """
-        Checks if a candle triggers Stop-Loss, Partial Take-Profits (TP1/TP2), or Full Take-Profit.
-        Enforces conservative intrabar execution: if SL and TP are touched within the same
-        1-minute candle, Stop-Loss takes priority on the currently open fraction.
-        """
-        symbol = pos.symbol
+        pos = self.portfolio.positions[symbol]
+        if timestamp <= pos.entry_time:
+            return closed_trades
 
         if pos.direction == "LONG":
-            sl_hit = low_p <= pos.stop_loss
-            if sl_hit:
-                base_exit = min(open_p, pos.stop_loss)
-                exit_price = self._apply_slippage(symbol, base_exit, "SELL")
-                return self.portfolio.close_position(
-                    symbol, exit_price, timestamp, "STOP_LOSS", self.commission_per_contract
+            # Conservative intrabar rule: check Stop-Loss first
+            if low_p <= pos.stop_loss:
+                exit_fill = pos.stop_loss - slip_pts
+                rec = self.portfolio.close_position(
+                    symbol=symbol,
+                    exit_price=exit_fill,
+                    timestamp=timestamp,
+                    exit_reason="STOP_LOSS",
+                    commission_per_side=self.commission_per_contract,
                 )
+                closed_trades.append(rec)
+                return closed_trades
 
-            # Evaluate intermediate partial targets (TP1, TP2)
+            # Check intermediate Partial Take-Profits (TP1, TP2)
             for pt in pos.partial_targets:
                 if not pt.get("hit", False) and high_p >= float(pt["price"]):
-                    pt_fill = max(open_p, float(pt["price"]))
                     pt["hit"] = True
-                    pt["hit_time"] = timestamp
-                    pt["hit_price"] = pt_fill
                     self.portfolio.record_partial_exit(
                         symbol=symbol,
-                        exit_price=pt_fill,
-                        weight=float(pt.get("weight", 0.30)),
+                        exit_price=float(pt["price"]),
+                        weight=float(pt["weight"]),
                         timestamp=timestamp,
-                        label=str(pt.get("label", "TP1")),
+                        label=str(pt.get("label", "TP")),
                         target_type=str(pt.get("target_type", "")),
                         commission_per_side=self.commission_per_contract,
                     )
 
-            tp_hit = high_p >= pos.take_profit
-            if tp_hit:
-                exit_price = max(open_p, pos.take_profit)
-                return self.portfolio.close_position(
-                    symbol, exit_price, timestamp, "TAKE_PROFIT", self.commission_per_contract
+            # Check Full Take-Profit
+            if high_p >= pos.take_profit:
+                rec = self.portfolio.close_position(
+                    symbol=symbol,
+                    exit_price=pos.take_profit,
+                    timestamp=timestamp,
+                    exit_reason="TAKE_PROFIT",
+                    commission_per_side=self.commission_per_contract,
                 )
+                closed_trades.append(rec)
+                return closed_trades
 
-        elif pos.direction == "SHORT":
-            sl_hit = high_p >= pos.stop_loss
-            if sl_hit:
-                base_exit = max(open_p, pos.stop_loss)
-                exit_price = self._apply_slippage(symbol, base_exit, "BUY")
-                return self.portfolio.close_position(
-                    symbol, exit_price, timestamp, "STOP_LOSS", self.commission_per_contract
+        else:
+            # SHORT position: check Stop-Loss first
+            if high_p >= pos.stop_loss:
+                exit_fill = pos.stop_loss + slip_pts
+                rec = self.portfolio.close_position(
+                    symbol=symbol,
+                    exit_price=exit_fill,
+                    timestamp=timestamp,
+                    exit_reason="STOP_LOSS",
+                    commission_per_side=self.commission_per_contract,
                 )
+                closed_trades.append(rec)
+                return closed_trades
 
-            # Evaluate intermediate partial targets (TP1, TP2)
+            # Check intermediate Partial Take-Profits (TP1, TP2)
             for pt in pos.partial_targets:
                 if not pt.get("hit", False) and low_p <= float(pt["price"]):
-                    pt_fill = min(open_p, float(pt["price"]))
                     pt["hit"] = True
-                    pt["hit_time"] = timestamp
-                    pt["hit_price"] = pt_fill
                     self.portfolio.record_partial_exit(
                         symbol=symbol,
-                        exit_price=pt_fill,
-                        weight=float(pt.get("weight", 0.30)),
+                        exit_price=float(pt["price"]),
+                        weight=float(pt["weight"]),
                         timestamp=timestamp,
-                        label=str(pt.get("label", "TP1")),
+                        label=str(pt.get("label", "TP")),
                         target_type=str(pt.get("target_type", "")),
                         commission_per_side=self.commission_per_contract,
                     )
 
-            tp_hit = low_p <= pos.take_profit
-            if tp_hit:
-                exit_price = min(open_p, pos.take_profit)
-                return self.portfolio.close_position(
-                    symbol, exit_price, timestamp, "TAKE_PROFIT", self.commission_per_contract
+            # Check Full Take-Profit
+            if low_p <= pos.take_profit:
+                rec = self.portfolio.close_position(
+                    symbol=symbol,
+                    exit_price=pos.take_profit,
+                    timestamp=timestamp,
+                    exit_reason="TAKE_PROFIT",
+                    commission_per_side=self.commission_per_contract,
                 )
+                closed_trades.append(rec)
+                return closed_trades
 
-        return None
+        return closed_trades

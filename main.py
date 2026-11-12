@@ -1,193 +1,216 @@
 from pathlib import Path
-from typing import List, Optional
-from core.data_loader import load_historical_data, load_databento_pair, resample_timeframe
-from domain.equilibrium import track_dealing_ranges
-from domain.fibonacci import track_fibonacci_ranges
-from domain.fvg import track_fvgs
-from domain.liquidity import track_liquidity, GapEngine
-from domain.smt import detect_smt_divergence
-from domain.structure import detect_structure
-from domain.swings import detect_swings
-from engine.event_bus import BacktestEngine, BacktestResult
-from engine.session_engine import extract_session_liquidity
-from strategies.base import BuyAndHoldStrategy, RandomEntryStrategy
-from strategies.ict_multi_tf import ICTMultiTimeframeStrategy
-from visualization.plotter import plot_liquidity_chart
+from typing import Dict, Optional, Tuple, List, Any
+import numpy as np
 import pandas as pd
 
-# --- EXECUTION MODES ---
-RUN_BACKTEST_AUDIT = True
-ENABLE_PLOTTING = False
+from core.data_loader import load_historical_data, load_databento_pair
+from engine.event_bus import BacktestEngine, BacktestResult
+from strategies.base import BuyAndHoldStrategy, RandomEntryStrategy
+from strategies.ict_multi_tf import ICTMultiTimeframeStrategy
 
-# --- DATA SOURCE & DATE RANGE SETTINGS ---
-USE_DATABENTO_5Y = True
-BACKTEST_START_DATE: Optional[str] = "2026-09-29 00:00:00"
+# ==============================================================================
+# 📅 BACKTEST DATE RANGE CONFIGURATION
+# ==============================================================================
+USE_DATABENTO_5Y: bool = True
+BACKTEST_START_DATE: Optional[str] = "2026-09-29"
 BACKTEST_END_DATE: Optional[str] = "2026-10-27 17:00:00"
 
-# Focus dates for October Journal Trades (#70 to #77) + Oct 16
+# Focus dates from your manual TradingView journal
 FOCUS_AUDIT_DATES: Optional[List[str]] = [
-    "2026-10-01",  # Trade #70 (NQ Short: TP1 + TP2 + FullTP)
-    "2026-10-02",  # Trade #71 (NQ Long: TP1 -> BE)
-    "2026-10-06",  # Trade #72 (ES Long: TP1 + TP2 -> BE)
-    "2026-10-08",  # Trade #73 (NQ Long: Loss)
-    "2026-10-13",  # Trade #74 (ES Short: FullTP Win)
-    "2026-10-14",  # Trade #75 (NQ Short: FullTP Win)
-    "2026-10-16",  # No-Trade day
-    "2026-10-21",  # Trade #76 (ES Short: TP1 -> BE)
-    "2026-10-26",  # Trade #77 (NQ Short: TP1 -> BE)
+    "2026-10-01",
+    "2026-10-02",
+    "2026-10-06",
+    "2026-10-08",
+    "2026-10-13",
+    "2026-10-14",
+    "2026-10-16",
+    "2026-10-21",
+    "2026-10-26",
 ]
 
-# --- HTF CHART VERIFICATION SETTINGS (Used when ENABLE_PLOTTING = True) ---
-CHART_TIMEFRAME = "15min"
-OVERLAY_HTF_ON_1M = False
-HTF_OVERLAY_TF = "15min"
 
+def generate_synthetic_pair_data(
+    es_path: Path, nq_path: Path, num_bars: int = 1500
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    np.random.seed(42)
+    idx = pd.date_range("2025-01-02 08:00:00", periods=num_bars, freq="1min", tz="America/New_York")
 
-def group_macros(macro_pools):
-    grouped = {}
-    for pool in macro_pools:
-        t = pool["time"]
-        if t not in grouped:
-            grouped[t] = []
-        grouped[t].append(pool)
-    return grouped
+    es_trend = np.sin(np.linspace(0, 12 * np.pi, num_bars)) * 15.0
+    es_noise = np.random.normal(0, 0.75, num_bars).cumsum()
+    es_close = np.round((5000.0 + es_trend + es_noise) * 4) / 4
+    es_open = np.roll(es_close, 1)
+    es_open[0] = es_close[0]
+    es_high = np.maximum(es_open, es_close) + np.round(np.abs(np.random.normal(0, 1.0, num_bars)) * 4) / 4
+    es_low = np.minimum(es_open, es_close) - np.round(np.abs(np.random.normal(0, 1.0, num_bars)) * 4) / 4
+    es_vol = np.random.randint(100, 5000, size=num_bars).astype(float)
 
-
-def print_comparative_table(results: List[BacktestResult]) -> None:
-    print("\n" + "=" * 114)
-    print(
-        f"{'STRATEGY NAME':<34} | {'SYM':<3} | {'TRADES':>6} | {'W/BE/L':>8} | {'WIN %':>6} | "
-        f"{'NET PnL ($)':>12} | {'PF':>5} | {'SHARPE':>6} | {'MAX DD %':>8} | {'AVG R':>6}"
+    df_es = pd.DataFrame(
+        {"open": es_open, "high": es_high, "low": es_low, "close": es_close, "volume": es_vol},
+        index=idx,
     )
-    print("-" * 114)
-    for r in results:
-        pf_str = f"{r.profit_factor:.2f}" if r.profit_factor != float("inf") else "  INF"
-        w_be_l = f"{r.win_count}/{r.be_count}/{r.loss_count}"
-        print(
-            f"{r.strategy_name:<34} | {r.symbol:<3} | {r.total_trades:>6} | {w_be_l:>8} | "
-            f"{r.win_rate:>5.1f}% | {r.net_profit:>+12.2f} | {pf_str:>5} | "
-            f"{r.sharpe_ratio:>6.2f} | {r.max_drawdown_pct:>7.2f}% | {r.avg_r_multiple:>+5.2f}R"
-        )
-    print("=" * 114)
+    df_es.index.name = "datetime"
+
+    nq_trend = np.sin(np.linspace(0, 12 * np.pi, num_bars)) * 60.0
+    nq_noise = np.random.normal(0, 2.5, num_bars).cumsum()
+    nq_close = np.round((18000.0 + nq_trend + nq_noise) * 4) / 4
+    nq_open = np.roll(nq_close, 1)
+    nq_open[0] = nq_close[0]
+    nq_high = np.maximum(nq_open, nq_close) + np.round(np.abs(np.random.normal(0, 3.0, num_bars)) * 4) / 4
+    nq_low = np.minimum(nq_open, nq_close) - np.round(np.abs(np.random.normal(0, 3.0, num_bars)) * 4) / 4
+    nq_vol = np.random.randint(100, 5000, size=num_bars).astype(float)
+
+    df_nq = pd.DataFrame(
+        {"open": nq_open, "high": nq_high, "low": nq_low, "close": nq_close, "volume": nq_vol},
+        index=idx,
+    )
+    df_nq.index.name = "datetime"
+
+    es_path.parent.mkdir(parents=True, exist_ok=True)
+    df_es.to_csv(es_path)
+    df_nq.to_csv(nq_path)
+    return df_es, df_nq
 
 
-def print_tradingview_audit(
-    symbol: str,
+def _print_tradingview_audit_log(
     result: BacktestResult,
-    strategy: ICTMultiTimeframeStrategy,
+    strategy_obj: ICTMultiTimeframeStrategy,
     focus_dates: Optional[List[str]] = None,
 ) -> None:
-    print(f"\n{'#' * 105}")
-    print(f"📋 TRADINGVIEW TRADE-BY-TRADE AUDIT LOG — {symbol} ({result.strategy_name})")
-    print(f"{'#' * 105}")
+    trades_by_date: Dict[str, List[Any]] = {}
+    for t in result.trades:
+        d_str = t.entry_time.strftime("%Y-%m-%d")
+        trades_by_date.setdefault(d_str, []).append(t)
 
-    trades = result.trades
-    trades_by_date = {}
-    for tr in trades:
-        d_str = tr.entry_time.strftime("%Y-%m-%d")
-        trades_by_date.setdefault(d_str, []).append(tr)
+    if focus_dates:
+        dates_to_show = focus_dates
+        focus_trade_count = sum(len(trades_by_date.get(d, [])) for d in focus_dates)
+        header_sub = (
+            f"Total Trades in Sample: {len(result.trades)} | "
+            f"Executed Trades on Focus Dates {focus_dates}: {focus_trade_count}"
+        )
+    else:
+        dates_to_show = sorted(trades_by_date.keys())
+        header_sub = f"Showing All {len(result.trades)} Executed Trades:"
 
-    dates_to_inspect = focus_dates if focus_dates else sorted(trades_by_date.keys())
-    focused_count = sum(len(trades_by_date.get(d, [])) for d in dates_to_inspect)
-    print(f"Total Trades in Sample: {len(trades)} | Executed Trades on Focus Dates {dates_to_inspect}: {focused_count}")
+    print("\n" + "#" * 105)
+    print(f"📋 TRADINGVIEW TRADE-BY-TRADE AUDIT LOG — {result.symbol} ({result.strategy_name})")
+    print("#" * 105)
+    print(header_sub)
 
     trade_counter = 0
-    for d_str in dates_to_inspect:
+    point_val = 50.0 if result.symbol.upper() == "ES" else 20.0
+
+    for d_str in dates_to_show:
         day_trades = trades_by_date.get(d_str, [])
         if day_trades:
-            for tr in day_trades:
+            for t in day_trades:
                 trade_counter += 1
-                meta = tr.metadata or {}
-                outcome = meta.get("outcome", "WIN" if tr.net_pnl > 0 else "LOSS")
-                icon = "✅" if outcome == "WIN" else ("🟡" if outcome == "BE" else "❌")
-
-                htf = meta.get("htf_trends", {})
-                htf_str = (
-                    f"4H={htf.get('4h', '?')}, 1H={htf.get('1h', '?')}, "
-                    f"15m={htf.get('15min', '?')}, 5m={htf.get('5min', '?')}, 1m={htf.get('1min', '?')}"
+                meta = t.metadata or {}
+                outcome_label = meta.get(
+                    "outcome",
+                    "BE" if t.exit_reason == "BE_TRAILED_SL" else ("WIN" if t.net_pnl > 0 else "LOSS"),
                 )
-                sl_anchor = meta.get("sl_anchor_detail", "")
-                sl_anchor_tag = f" ({sl_anchor})" if sl_anchor else ""
-
-                print(
-                    f"\n  {icon} [{d_str} — Trade #{trade_counter}] {symbol} {tr.direction} | Result: {outcome} | Grade: {meta.get('grade', '?')} (Score: {meta.get('score', '?')}/10)"
-                )
-                print(
-                    f"    • Entry Time (NY) : {tr.entry_time.strftime('%Y-%m-%d %H:%M')}  --> Check this 1m bar on TradingView"
-                )
-                print(
-                    f"    • Exit Time (NY)  : {tr.exit_time.strftime('%Y-%m-%d %H:%M')}  ({tr.exit_reason})"
-                )
-                print(
-                    f"    • Prices          : Entry = {tr.entry_price:.2f} | SL = {tr.stop_loss:.2f}{sl_anchor_tag} | TP = {tr.take_profit:.2f} | Exit = {tr.exit_price:.2f}"
-                )
-                print(
-                    f"    • Risk / Reward   : Planned FullTP RR = {meta.get('planned_rr', 0.0):.2f}R | Realized = {tr.r_multiple:+.2f}R | Net PnL = ${tr.net_pnl:+.2f} (Qty: {tr.quantity})"
-                )
-
-                partials_plan = meta.get("partial_targets", [])
-                if partials_plan:
-                    rem_pct = int(round((1.0 - sum(p.get("weight", 0.30) for p in partials_plan)) * 100))
-                    parts_str = " | ".join(
-                        f"{p['label']} ({int(round(p.get('weight', 0.30) * 100))}%): {p['price']:.2f} ({p['rr']:.2f}R, {p['target_type']})"
-                        for p in partials_plan
-                    )
-                    print(
-                        f"    • Targets (DOL)   : {parts_str} | FullTP ({rem_pct}%): {tr.take_profit:.2f} ({meta.get('planned_rr', 0.0):.2f}R, {meta.get('target_type', '?')})"
-                    )
+                if outcome_label == "WIN":
+                    icon = "✅"
+                elif outcome_label == "BE":
+                    icon = "🟡"
                 else:
-                    print(
-                        f"    • Target (DOL)    : {meta.get('target_type', '?')} (Tier {meta.get('target_tier', '?')})"
-                    )
+                    icon = "❌"
 
-                if meta.get("management_summary"):
-                    print(f"    • Position Mgmt   : {meta['management_summary']}")
+                grade = meta.get("grade", "N/A")
+                score = meta.get("score", "N/A")
+                target_type = meta.get("target_type", "FIXED_RR")
+                target_tier = meta.get("target_tier", "N/A")
+                planned_rr = meta.get("planned_rr", t.r_multiple)
+                partial_targets = meta.get("partial_targets", [])
+                mgmt_summary = meta.get("management_summary", "")
+                ret_type = meta.get("retracement_type", "N/A")
+                ret_det = meta.get("retracement_detail", "N/A")
+                trigger_det = meta.get("entry_trigger_detail", "N/A")
+                sl_anchor_det = meta.get("sl_anchor_detail", "")
+                liq_lvl = meta.get("liquidity_already_taken", "LOW")
+                taken_pools = meta.get("session_taken_pools", [])
+                htf = meta.get("htf_trends", {})
+                swept_det = meta.get("swept_pools_detail", [])
+                smt_det = meta.get("smt_detail", [])
+                pros = meta.get("pros", [])
+                cons = meta.get("cons", [])
+
+                taken_pools_str = ", ".join(taken_pools) if taken_pools else "None taken since 09:30 NY open"
+                sl_anchor_tag = f" ({sl_anchor_det})" if sl_anchor_det else ""
+
+                risk_pts = abs(t.entry_price - t.stop_loss)
+                dollar_risk = risk_pts * point_val * float(t.quantity)
+                risk_pct = (dollar_risk / result.initial_capital) * 100.0
+                qty_label = meta.get("display_qty", f"{t.quantity} {t.symbol}")
+
+                if partial_targets:
+                    pt_parts = []
+                    used_w = 0.0
+                    for pt in partial_targets:
+                        w_pct = int(round(pt["weight"] * 100))
+                        used_w += pt["weight"]
+                        pt_parts.append(
+                            f"{pt['label']} ({w_pct}%): {pt['price']:.2f} ({pt['rr']:.2f}R, {pt['target_type']})"
+                        )
+                    rem_pct = max(0, int(round((1.0 - used_w) * 100)))
+                    pt_parts.append(f"FullTP ({rem_pct}%): {t.take_profit:.2f} ({planned_rr:.2f}R, {target_type})")
+                    target_line_str = f"    • Targets (DOL)   : {' | '.join(pt_parts)}\n"
+                else:
+                    target_line_str = f"    • Target (DOL)    : {target_type} (Tier {target_tier})\n"
+
+                mgmt_line = f"    • Position Mgmt   : {mgmt_summary}\n" if mgmt_summary else ""
 
                 print(
-                    f"    • 1m Entry Trigger: {meta.get('entry_trigger_detail', '?')}"
+                    f"\n  {icon} [{d_str} — Trade #{trade_counter}] {t.symbol} {t.direction} | "
+                    f"Result: {outcome_label} | Grade: {grade} (Score: {score}/10)\n"
+                    f"    • Entry Time (NY) : {t.entry_time.strftime('%Y-%m-%d %H:%M')}  --> Check this 1m bar on TradingView\n"
+                    f"    • Exit Time (NY)  : {t.exit_time.strftime('%Y-%m-%d %H:%M')}  ({t.exit_reason})\n"
+                    f"    • Prices          : Entry = {t.entry_price:.2f} | SL = {t.stop_loss:.2f}{sl_anchor_tag} | "
+                    f"TP = {t.take_profit:.2f} | Exit = {t.exit_price:.2f}\n"
+                    f"    • Risk / Reward   : Risk = ${dollar_risk:.2f} ({risk_pct:.2f}% | {risk_pts:.2f} pts) | "
+                    f"Planned FullTP RR = {planned_rr:.2f}R | Realized = {t.r_multiple:+.2f}R | "
+                    f"Net PnL = ${t.net_pnl:+.2f} (Qty: {qty_label})\n"
+                    f"{target_line_str}"
+                    f"{mgmt_line}"
+                    f"    • 1m Entry Trigger: {trigger_det}\n"
+                    f"    • Retracement     : {ret_type} -> {ret_det}\n"
+                    f"    • Market Context  : 4H={htf.get('4h')}, 1H={htf.get('1h')}, "
+                    f"15m={htf.get('15min')}, 5m={htf.get('5min')}, 1m={htf.get('1min')} (Locked at Entry)\n"
+                    f"    • Liq Exhaustion  : {liq_lvl} ({taken_pools_str})"
                 )
-                print(
-                    f"    • Retracement     : {meta.get('retracement_type', '?')} -> {meta.get('retracement_detail', '?')}"
-                )
-                print(
-                    f"    • Market Context  : {htf_str} (Locked at Entry)"
-                )
-                taken_list = meta.get("session_taken_pools", [])
-                taken_str = ", ".join(taken_list) if taken_list else "None taken since 09:30 NY open"
-                print(
-                    f"    • Liq Exhaustion  : {meta.get('liquidity_already_taken', '?')} ({taken_str})"
-                )
-                if meta.get("swept_pools_detail"):
-                    print(f"    • Swept Liquidity : {'; '.join(meta['swept_pools_detail'])}")
-                if meta.get("smt_detail"):
-                    print(f"    • Active SMT      : {'; '.join(meta['smt_detail'])}")
-                if meta.get("pros"):
-                    print(f"    • Pros (+)        : {'; '.join(meta['pros'])}")
-                if meta.get("cons"):
-                    print(f"    • Cons (-)        : {'; '.join(meta['cons'])}")
+                if swept_det:
+                    print(f"    • Swept Liquidity : {'; '.join(swept_det)}")
+                if smt_det:
+                    print(f"    • Active SMT      : {'; '.join(smt_det)}")
+                if pros:
+                    print(f"    • Pros (+)        : {'; '.join(pros)}")
+                if cons:
+                    print(f"    • Cons (-)        : {'; '.join(cons)}")
         else:
-            summary = strategy.daily_window_summary.get(d_str, {})
-            htf = summary.get("htf_trends", {})
-            ctx_time = summary.get("context_time", "09:50")
-            htf_str = (
-                f"4H={htf.get('4h', '?')}, 1H={htf.get('1h', '?')}, "
-                f"15m={htf.get('15min', '?')}, 5m={htf.get('5min', '?')}"
-            )
-            taken_list = summary.get("session_taken_pools", [])
-            taken_str = ", ".join(taken_list) if taken_list else "None taken since 09:30 NY open"
-            diags = strategy.daily_diagnostics.get(d_str, [])
+            win_sum = strategy_obj.daily_window_summary.get(d_str, {})
+            diags = strategy_obj.daily_diagnostics.get(d_str, [])
+            htf = win_sum.get("htf_trends", {})
+            ctx_time = win_sum.get("context_time", "09:55")
+            liq_lvl = win_sum.get("liquidity_already_taken", "N/A")
+            taken_pools = win_sum.get("session_taken_pools", [])
+            smts = win_sum.get("smt_descriptions", [])
+            taken_pools_str = ", ".join(taken_pools) if taken_pools else "None taken since 09:30 NY open"
 
-            print(f"\n  ⚪ [{d_str} — NO TRADE EXECUTED ON {symbol}] Diagnostic Breakdown (09:40 - 10:30 NY):")
-            print(f"    • Window Context  : {htf_str} (Locked at {ctx_time})")
-            print(f"    • Liq Exhaustion  : {summary.get('liquidity_already_taken', 'LOW')} ({taken_str})")
-            if summary.get("smt_descriptions"):
-                print(f"    • Active SMTs     : {'; '.join(summary['smt_descriptions'])}")
+            print(
+                f"\n  ⚪ [{d_str} — NO TRADE EXECUTED ON {result.symbol}] Diagnostic Breakdown (09:40 - 10:30 NY):\n"
+                f"    • Window Context  : 4H={htf.get('4h', 'N/A')}, 1H={htf.get('1h', 'N/A')}, "
+                f"15m={htf.get('15min', 'N/A')}, 5m={htf.get('5min', 'N/A')} (Locked at {ctx_time})\n"
+                f"    • Liq Exhaustion  : {liq_lvl} ({taken_pools_str})\n"
+                f"    • Active SMTs     : {'; '.join(smts) if smts else 'None confirmed during window'}"
+            )
             if diags:
                 print("    • Why Not Taken   :")
-                for reason in diags[:8]:
+                for reason in diags[:20]:
                     print(f"        - {reason}")
             else:
-                print("    • Why Not Taken   : No 1m BOS/CHoCH/IFVG_BOS trigger occurred during 09:40 - 10:30 NY.")
+                print("    • Why Not Taken   : No 1m BOS/CHoCH occurred in a valid direction during 09:40 - 10:30.")
+    print("#" * 105 + "\n")
 
 
 def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
@@ -218,10 +241,10 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
         f"   NQ Range: {df_nq_1m.index[0]} -> {df_nq_1m.index[-1]} ({len(df_nq_1m)} bars)"
     )
 
-    all_results: List[BacktestResult] = []
-    shared_dates_all_grades = {}
-    shared_dates_grade_a = {}
+    shared_dates_grade_b: Dict[Any, Any] = {}
+    shared_dates_grade_a: Dict[Any, Any] = {}
 
+    all_results: List[BacktestResult] = []
     for sym, df_prim, df_sec, default_sl in (
         ("ES", df_es_1m, df_nq_1m, 5.5),
         ("NQ", df_nq_1m, df_es_1m, 42.0),
@@ -232,200 +255,90 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
             initial_capital=100_000.0,
             commission_per_contract=2.00,
             slippage_ticks=1,
+            swing_confirmation_bars=2,
         )
 
-        # Baseline 1: Buy and Hold
-        bh_strat = BuyAndHoldStrategy(quantity=1)
-        bh_res = engine.run(df_prim, strategy=bh_strat, precompute_domain=False)
-        all_results.append(bh_res)
-
-        # Baseline 2: Random Entry with matching SL/TP risk geometry
-        rnd_strat = RandomEntryStrategy(
-            stop_loss_points=default_sl,
-            take_profit_points=default_sl * 2.0,
-            entry_probability=0.005,
-            quantity=1,
-            seed=42,
+        res_bh = engine.run(df_prim, strategy=BuyAndHoldStrategy(quantity=1), precompute_domain=False)
+        res_rand = engine.run(
+            df_prim,
+            strategy=RandomEntryStrategy(
+                stop_loss_points=default_sl,
+                take_profit_points=default_sl * 2.0,
+                quantity=1,
+                seed=42,
+            ),
+            precompute_domain=False,
         )
-        rnd_res = engine.run(df_prim, strategy=rnd_strat, precompute_domain=False)
-        all_results.append(rnd_res)
 
-        # Strategy Variant A: ICT Strategy allowing Grade B setups (Unfiltered)
         ict_all_grades = ICTMultiTimeframeStrategy(
             stop_loss_points=default_sl,
             reward_risk_ratio=2.0,
             min_rr=1.65,
             min_tp1_rr=0.80,
+            max_rr=3.85,
+            partial_cut_pct=0.30,
+            enable_partials=True,
+            enable_trailing_sl=True,
             risk_per_trade_pct=0.01,
             use_dynamic_sizing=True,
             sl_mode="tight_1m",
             min_grade="B",
-            shared_daily_trade_dates=shared_dates_all_grades,
+            require_killzone=True,
+            max_trades_per_day=1,
+            shared_daily_trade_dates=shared_dates_grade_b,
         )
         ict_all_grades.name = "ICT_Strategy (Allow Grade B)"
         res_b = engine.run(df_prim, strategy=ict_all_grades, df_secondary=df_sec, precompute_domain=True)
-        all_results.append(res_b)
 
-        # Strategy Variant B: ICT Strategy strictly filtering for Grade A / A+ only
-        ict_grade_a = ICTMultiTimeframeStrategy(
+        ict_a_only = ICTMultiTimeframeStrategy(
             stop_loss_points=default_sl,
             reward_risk_ratio=2.0,
             min_rr=1.65,
             min_tp1_rr=0.80,
+            max_rr=3.85,
+            partial_cut_pct=0.30,
+            enable_partials=True,
+            enable_trailing_sl=True,
             risk_per_trade_pct=0.01,
             use_dynamic_sizing=True,
             sl_mode="tight_1m",
             min_grade="A",
+            require_killzone=True,
+            max_trades_per_day=1,
             shared_daily_trade_dates=shared_dates_grade_a,
         )
-        ict_grade_a.name = "ICT_Strategy (Grade A/A+ Only)"
-        res_a = engine.run(df_prim, strategy=ict_grade_a, df_secondary=df_sec, precompute_domain=True)
-        all_results.append(res_a)
+        ict_a_only.name = "ICT_Strategy (Grade A/A+ Only)"
+        res_a = engine.run(df_prim, strategy=ict_a_only, df_secondary=df_sec, precompute_domain=True)
 
-        print_tradingview_audit(sym, res_a, ict_grade_a, focus_dates=FOCUS_AUDIT_DATES)
+        _print_tradingview_audit_log(res_a, ict_a_only, focus_dates=FOCUS_AUDIT_DATES)
+        all_results.extend([res_bh, res_rand, res_b, res_a])
 
-    print_comparative_table(all_results)
-
-
-def run_pipeline(primary_path: Path, secondary_path: Path, timeframe: str = "1min"):
-    print("1. Loading 1-minute historical data (ES & NQ)...")
-    if USE_DATABENTO_5Y:
-        df_es_1m, df_nq_1m = load_databento_pair(
-            data_dir=primary_path.parent,
-            start_date=BACKTEST_START_DATE,
-            end_date=BACKTEST_END_DATE,
-        )
-    else:
-        df_es_1m = load_historical_data(primary_path, start_date=BACKTEST_START_DATE, end_date=BACKTEST_END_DATE)
-        df_nq_1m = load_historical_data(secondary_path, start_date=BACKTEST_START_DATE, end_date=BACKTEST_END_DATE)
-
-    df_es_1m = df_es_1m[(df_es_1m["high"] - df_es_1m["low"]) < 40.0]
-    df_nq_1m = df_nq_1m[(df_nq_1m["high"] - df_nq_1m["low"]) < 150.0]
-
-    print("2. Extracting Macro Session Liquidity...")
-    es_macro_by_time = group_macros(extract_session_liquidity(df_es_1m))
-    nq_macro_by_time = group_macros(extract_session_liquidity(df_nq_1m))
-
-    if timeframe != "1min":
-        print(f"   Resampling 1m data to Higher Timeframe ({timeframe})...")
-        df_es = resample_timeframe(df_es_1m, timeframe)
-        df_nq = resample_timeframe(df_nq_1m, timeframe)
-        smt_window = 60
-    else:
-        df_es = df_es_1m
-        df_nq = df_nq_1m
-        smt_window = 15
-
-    print(f"3. Detecting {timeframe} Swings, Structure, Equilibrium & Fibonacci Ranges...")
-    es_swings = detect_swings(df_es)
-    es_structure = detect_structure(df_es, es_swings)
-    es_ranges = track_dealing_ranges(df_es, es_swings)
-    es_fibs = track_fibonacci_ranges(df_es, es_swings)
-
-    nq_swings = detect_swings(df_nq)
-    nq_structure = detect_structure(df_nq, nq_swings)
-    nq_ranges = track_dealing_ranges(df_nq, nq_swings)
-    nq_fibs = track_fibonacci_ranges(df_nq, nq_swings)
-
-    print(f"4. Running Spatial-Indexed Liquidity Engine on {timeframe} (Tolerance=2)...")
-    _, es_liq_engine = track_liquidity(es_structure, es_swings, es_macro_by_time, tolerance_ticks=2)
-    _, nq_liq_engine = track_liquidity(nq_structure, nq_swings, nq_macro_by_time, tolerance_ticks=2)
-
-    gap_engine = GapEngine()
-    for row in df_es.itertuples():
-        gap_engine.process_candle(row.Index, row.open, row.close, row.high, row.low)
-
-    print(f"5. Detecting and tracking {timeframe} Fair Value Gaps (FVG)...")
-    es_fvgs = track_fvgs(df_es)
-    nq_fvgs = track_fvgs(df_nq)
-
-    print(f"6. Calculating {timeframe} SMT Divergence...")
-    smt_events = detect_smt_divergence(
-        es_swings,
-        nq_swings,
-        df_es,
-        df_nq,
-        time_window_minutes=smt_window,
-        timeframe=timeframe,
-        df_es_1m=df_es_1m,
-        df_nq_1m=df_nq_1m,
+    print("=" * 114)
+    print(
+        f"{'STRATEGY NAME':<34} | {'SYM':<3} | {'TRADES':>6} | {'W/BE/L':>7} | {'WIN %':>6} | "
+        f"{'NET PnL ($)':>12} | {'PF':>5} | {'SHARPE':>6} | {'MAX DD %':>8} | {'AVG R':>6}"
     )
-    print(f"--> Found {len(smt_events)} SMT Events on {timeframe}.")
-    for smt in smt_events[-5:]:
-        print(f"    {smt['description']}")
-
-    es_pools = es_liq_engine.get_all_pools()
-    nq_pools = nq_liq_engine.get_all_pools()
-
-    if timeframe == "1min" and OVERLAY_HTF_ON_1M:
-        print(f"7. Computing {HTF_OVERLAY_TF} HTF Confluences to overlay on 1m chart...")
-        df_es_htf = resample_timeframe(df_es_1m, HTF_OVERLAY_TF)
-        df_nq_htf = resample_timeframe(df_nq_1m, HTF_OVERLAY_TF)
-
-        es_htf_swings = detect_swings(df_es_htf)
-        nq_htf_swings = detect_swings(df_nq_htf)
-
-        es_ranges = track_dealing_ranges(df_es_htf, es_htf_swings)
-        nq_ranges = track_dealing_ranges(df_nq_htf, nq_htf_swings)
-
-        es_fibs = track_fibonacci_ranges(df_es_htf, es_htf_swings)
-        nq_fibs = track_fibonacci_ranges(df_nq_htf, nq_htf_swings)
-
-        es_fvgs = track_fvgs(df_es_htf)
-        nq_fvgs = track_fvgs(df_nq_htf)
-
-    return (
-        df_es, es_swings, es_pools, es_fvgs, es_ranges, es_fibs,
-        df_nq, nq_swings, nq_pools, nq_fvgs, nq_ranges, nq_fibs,
-        gap_engine, smt_events,
-    )
-
-
-def main():
-    es_data_path = Path("data/es_1m_sample.csv")
-    nq_data_path = Path("data/nq_1m_sample.csv")
-
-    if RUN_BACKTEST_AUDIT:
-        run_backtest_suite(es_data_path, nq_data_path)
-
-    if ENABLE_PLOTTING:
-        (
-            df_es, es_swings, es_pools, es_fvgs, es_ranges, es_fibs,
-            df_nq, nq_swings, nq_pools, nq_fvgs, nq_ranges, nq_fibs,
-            gap_engine, smt_events,
-        ) = run_pipeline(es_data_path, nq_data_path, timeframe=CHART_TIMEFRAME)
-
-        print(f"Rendering {CHART_TIMEFRAME} chart overlays...")
-        common_index = df_es.index.intersection(df_nq.index)
-        if len(common_index) == 0:
-            print("CRITICAL: ES and NQ datasets have absolutely no overlapping timeframes.")
-            return
-
-        if smt_events:
-            target_time = smt_events[-1]["time"]
-            target_idx = common_index.get_indexer([target_time], method="nearest")[0]
-            start_idx = max(0, target_idx - 60)
-            end_idx = min(len(common_index) - 1, target_idx + 60)
-        else:
-            end_idx = len(common_index) - 1
-            start_idx = max(0, end_idx - 120)
-
-        start_time = common_index[start_idx]
-        end_time = common_index[end_idx]
-
-        plot_df_es = df_es[(df_es.index >= start_time) & (df_es.index <= end_time)]
-        plot_df_nq = df_nq[(df_nq.index >= start_time) & (df_nq.index <= end_time)]
-
-        plot_liquidity_chart(
-            plot_df_es, es_pools, es_swings,
-            fvgs=[], ranges=[], fibs=[],
-            title=f"E-Mini S&P 500 (ES) - {CHART_TIMEFRAME}",
+    print("-" * 114)
+    for r in all_results:
+        pf_str = f"{r.profit_factor:.2f}" if r.profit_factor != float("inf") else "INF"
+        w_be_l = f"{r.win_count}/{r.be_count}/{r.loss_count}"
+        print(
+            f"{r.strategy_name:<34} | {r.symbol:<3} | {r.total_trades:>6} | {w_be_l:>7} | "
+            f"{r.win_rate:>5.1f}% | {r.net_profit:>+12.2f} | {pf_str:>5} | "
+            f"{r.sharpe_ratio:>6.2f} | {r.max_drawdown_pct:>7.2f}% | {r.avg_r_multiple:>+5.2f}R"
         )
-        plot_liquidity_chart(
-            plot_df_nq, nq_pools, nq_swings,
-            fvgs=[], ranges=[], fibs=[],
-            title=f"E-Mini Nasdaq 100 (NQ) - {CHART_TIMEFRAME}",
-        )
+    print("=" * 114)
+
+
+def main() -> None:
+    data_dir = Path("data")
+    es_data_path = data_dir / "es_1m_sample.csv"
+    nq_data_path = data_dir / "nq_1m_sample.csv"
+
+    if not USE_DATABENTO_5Y and (not es_data_path.exists() or not nq_data_path.exists()):
+        generate_synthetic_pair_data(es_data_path, nq_data_path, num_bars=1500)
+
+    run_backtest_suite(es_data_path, nq_data_path)
 
 
 if __name__ == "__main__":
