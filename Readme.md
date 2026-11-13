@@ -7,9 +7,9 @@ Built entirely in Python, the engine processes historical data to execute struct
 ### Core Design Principles
 
 - **Zero Lookahead Bias:** The deadliest sin in quantitative finance is peeking into the future. This engine enforces strict temporal boundaries; all structural and entry logic is evaluated strictly on closed candle states to ensure mathematically valid test results.
+- **Trader's Experience Encapsulation:** The system explicitly hardcodes "veteran trader" experience into the execution logic. By injecting human context—such as blocking counter-trend shorts into All-Time Highs or forbidding continuation trades after exhausted 200+ point expansion legs—the engine avoids the common pitfall of executing mathematically valid but contextually poor setups.
 - **Modular Architecture:** Strategy logic is decoupled from broker simulation. Modifications to how a swing point or Fibonacci level is calculated do not require re-engineering the core portfolio or execution manager.
 - **Accuracy Over Speed:** The primary objective is absolute mathematical precision and visual chart alignment over raw execution speed.
-- **Deterministic Guardrails:** The system hardcodes "veteran trader" experience (e.g., blocking counter-trend shorts into All-Time Highs, preventing entries after exhausted 200+ point expansion legs) to prevent machine learning models from curve-fitting to random noise.
 
 ---
 
@@ -30,13 +30,14 @@ This project follows an 8-month academic development lifecycle aligned with bach
 - [x] Integrate quantitative performance metrics (Total return, Sharpe ratio, Maximum drawdown, Win rate, Profit factor).
 - [x] Implement baseline benchmark strategies: Random Entries (with identical risk parameters) and Buy-and-Hold.
 - [x] Run comparative backtests to evaluate whether formal ICT setups exhibit statistical advantage over random entries.
+- [x] **Trader's Experience Implementation:** Hardcode qualitative market wisdom (e.g., dynamic Draw-On-Liquidity targeting, 1m structural/IFVG trailing stops, and setup grading from B to A+) directly into the trade management system.
 - [x] Generate an Automated Trade Audit Log with precise execution timestamps, multi-tier partial take-profits, and exact PnL dollar figures.
 - [x] Implement dynamic Micro-contract (MES/MNQ) fallback sizing to enforce strict dollar-risk limits ($800–$1,100) on highly volatile setups.
 
 #### Stage 3: Machine Learning Optimization & Adaptivity (Month 5)
 - [ ] Parameterize system constants (liquidity tolerances, macro time windows) into configuration files.
 - [ ] Implement Walk-Forward optimization (In-Sample / Out-of-Sample windows) for adaptive parameter tuning.
-- [ ] **Machine Learning Optimization:** Feed historical execution data through an ML optimizer to analyze thousands of executed trades. Bounded by the engine's deterministic guardrails, the ML model will identify valid statistical edges and hidden correlations (e.g., time-of-day, volatility, stop-loss widths) without curve-fitting.
+- [ ] **Machine Learning Optimization:** Feed historical execution data through an ML optimizer to analyze thousands of executed trades. Bounded by the engine's deterministic experience guardrails, the ML model will identify valid statistical edges and hidden correlations (e.g., time-of-day, volatility, stop-loss widths) without curve-fitting.
 
 #### Stage 4: LLM-Based Analytics & Translation (Month 6)
 - [ ] **LLM Translation Agent:** Integrate a structured LLM explanation module to act as a bridge between the complex quantitative output and human readability.
