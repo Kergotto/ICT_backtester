@@ -245,7 +245,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                     if c["priority"] <= 2
                     and (tp1_cand["rr"] + 0.35) <= c["rr"] <= (full_tp["rr"] - 0.35)
                 ]
-                if not mid_cands and tp1_cand["rr"] >= 1.20:
+                if not mid_cands and tp1_cand["rr"] >= self.min_tp1_rr and full_tp["rr"] <= 2.00:
                     higher_prio1 = [
                         c for c in full_tp_cands
                         if c["priority"] == 1 and (full_tp["rr"] + 0.50) <= c["rr"] <= self.max_rr
@@ -400,13 +400,19 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         num_partials_hit = len(pos.partial_exits)
         tp1_hit = num_partials_hit >= 1
         tp2_hit = num_partials_hit >= 2
+        tp2_hit_prior = any(
+            pe.get("label") == "TP2" and pe["time"] < ctx.timestamp
+            for pe in pos.partial_exits
+        )
 
         wanted_struct_dir = "BULLISH" if pos.direction == "LONG" else "BEARISH"
         opposite_struct_dir = "BEARISH" if pos.direction == "LONG" else "BULLISH"
 
         # 1. Straight-expansion Break-Even protection ONLY on single-TP trades (when >= 80% toward FullTP)
         has_planned_partials = len(pos.partial_targets) > 0
-        if not has_planned_partials and progress_to_full_tp >= 0.80 and abs(pos.stop_loss - pos.initial_stop_loss) < 1e-9:
+        if not has_planned_partials and progress_to_full_tp >= 0.80 and abs(
+            pos.stop_loss - pos.initial_stop_loss
+        ) < 1e-9:
             if pos.direction == "LONG":
                 be_swings = [
                     s for s in ctx.confirmed_swings
@@ -440,7 +446,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                             f"above {best_be['time'].strftime('%H:%M')} BE swing high @ {best_be['price']:.2f}",
                         )
 
-        # 2. Check if the current 1m bar completed a structure break (or counter-FVG inversion) back in the trade direction
+        # 2. Check if the current 1m bar completed a structure break back in the trade direction
         recent_1m_events = ctx.structure_events_1m[-10:] if ctx.structure_events_1m else []
         cont_event = None
         for ev in reversed(recent_1m_events):
@@ -450,43 +456,23 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
 
         last_trail_ts = pos.metadata.get("last_trail_event_time", pos.entry_time)
 
-        # Check if a counter-direction 1m FVG formed during a post-entry pullback
-        # was inverted on the current bar (e.g., 09:53 BISI inverted at 09:56 after sweeping 30800.75 on Oct 1)
-        counter_fvg_type = "SIBI" if pos.direction == "LONG" else "BISI"
-        had_counter_fvg_inversion = False
-        if cont_event is None:
-            for rf in getattr(ctx, "recent_fvgs_all", []):
-                if rf.fvg_type == counter_fvg_type and rf.creation_time > last_trail_ts:
-                    for ev_name, ev_ts, _ in rf.events:
-                        if ev_name == "INVERTED" and ev_ts == ctx.timestamp:
-                            cont_event = {
-                                "time": ctx.timestamp,
-                                "close_time": ctx.timestamp,
-                                "kind": "IFVG_BOS",
-                                "direction": wanted_struct_dir,
-                            }
-                            had_counter_fvg_inversion = True
-                            break
-                    if cont_event is not None:
-                        break
-
         if cont_event is None:
             return
 
         if cont_event["close_time"] <= last_trail_ts:
             return
 
-        # Only advance `window_anchor_ts` to TP2's timestamp if TP2 occurred at least 2 minutes BEFORE
-        # the current bar (so a TP2 hit on the same bar as `cont_event` never wipes out the pullback window)
+        # Advance `window_anchor_ts` to the most recent partial exit (TP1 or TP2) that occurred
+        # strictly BEFORE the current bar (`pe["time"] < ctx.timestamp`).
         window_anchor_ts = last_trail_ts
-        prior_tp2_exits = [
+        prior_partial_exits = [
             pe for pe in pos.partial_exits
-            if pe.get("label") == "TP2" and pe["time"] <= (ctx.timestamp - pd.Timedelta(minutes=2))
+            if pe["time"] < ctx.timestamp
         ]
-        if prior_tp2_exits:
-            last_tp2_ts = prior_tp2_exits[-1]["time"]
-            if last_tp2_ts > window_anchor_ts:
-                window_anchor_ts = last_tp2_ts
+        if prior_partial_exits:
+            last_pe_ts = prior_partial_exits[-1]["time"]
+            if last_pe_ts > window_anchor_ts:
+                window_anchor_ts = last_pe_ts
 
         had_counter_bos = any(
             e["direction"] == opposite_struct_dir and window_anchor_ts < e["close_time"] < cont_event["close_time"]
@@ -513,11 +499,11 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
             pullback_time = window_df["low"].idxmin()
             prior_swings = [
                 s for s in ctx.confirmed_swings
-                if s["type"] == "SwingLow" and pos.entry_time <= s["time"] < pullback_time
+                if s["type"] == "SwingLow" and window_anchor_ts <= s["time"] < pullback_time
             ]
             swept_cluster = sum(1 for s in prior_swings if pullback_low < float(s["price"])) >= 1
             cluster_touches = int((window_df["low"] <= (pullback_low + buffer_pts)).sum())
-            if not (had_counter_bos or had_fvg_inversion or had_counter_fvg_inversion or swept_cluster or (tp2_hit and cluster_touches >= 2)):
+            if not (had_counter_bos or had_fvg_inversion or swept_cluster or (tp2_hit_prior and cluster_touches >= 2)):
                 return
 
             raw_new_sl = pullback_low if (tp2_hit and cluster_touches >= 2) else (pullback_low - buffer_pts)
@@ -548,7 +534,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
             ]
             swept_cluster = sum(1 for s in prior_swings if pullback_high > float(s["price"])) >= 1
             cluster_touches = int((window_df["high"] >= (pullback_high - buffer_pts)).sum())
-            if not (had_counter_bos or had_fvg_inversion or had_counter_fvg_inversion or swept_cluster or (tp2_hit and cluster_touches >= 2)):
+            if not (had_counter_bos or had_fvg_inversion or swept_cluster or (tp2_hit_prior and cluster_touches >= 2)):
                 return
 
             raw_new_sl = pullback_high if (tp2_hit and cluster_touches >= 2) else (pullback_high + buffer_pts)
@@ -990,27 +976,36 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
 
         return grade, score, pros, cons
 
-    def _calculate_contracts(self, portfolio: Portfolio, symbol: str, actual_risk_pts: float) -> Tuple[ float, str ]:
+    def _calculate_contracts(
+        self,
+        portfolio: Portfolio,
+        symbol: str,
+        actual_risk_pts: float,
+        num_partials: int = 0,
+    ) -> Tuple[float, str, int, str]:
         """
-        Targets ~$900-$1,000 risk and NEVER exceeds $1,100 risk.
-        1. Tries whole standard contracts (ES / NQ) first:
-           - If `low_lots` risk is > $800 (and <= $1,000), uses `low_lots` (or `high_lots` if <= $1,100 and closer to $1,000).
-           - If `low_lots` risk is too low (<= $800), raises to `high_lots` ONLY if `high_lots` risk <= $1,100.
-        2. If standard contracts cannot land in ($800, $1,100] (e.g., 1 NQ > $1,100 on Oct 1, or 2 ES = $750 / 3 ES = $1,125 on Oct 6),
-           automatically switches to Micro contracts (MNQ / MES, where 1 Micro = 0.1 Standard contract) to size right around ~$1,000!
+        Sizes positions to match TradingView whole-contract execution:
+        1. Tries whole standard contracts (ES / NQ) within ($800, $1,100] as long as there are enough
+           whole contracts to split across all partial targets (`chosen_std > num_partials`).
+        2. Otherwise falls back to Micro contracts (MES / MNQ).
+        3. On 3-target setups (`num_partials == 2`, 30%/30%/40%), if `chosen_micro` would force an equal
+           lot split where FullTP has no majority over TP1 (e.g., 6 MNQ -> 2 / 2 / 2), bumps by +1 Micro
+           (to 7 MNQ -> 2 / 2 / 3) if risk stays <= $1,200.
         """
         clean_sym = symbol.upper()
         if not self.use_dynamic_sizing or actual_risk_pts <= 0:
-            return float(self.quantity), f"{self.quantity} {clean_sym}"
+            lots = max(1, int(self.quantity))
+            return float(lots), f"{lots} {clean_sym}", lots, clean_sym
 
-        target_risk = self.initial_target_risk if hasattr(self, "initial_target_risk") else (100_000.0 * self.risk_per_trade_pct)
+        target_risk = 100_000.0 * self.risk_per_trade_pct  # $1,000.00
         min_acceptable_risk = target_risk * 0.80  # $800.00
         max_acceptable_risk = target_risk * 1.10  # $1,100.00
 
         std_point_val = portfolio.get_point_value(clean_sym)
         std_unit_risk = actual_risk_pts * std_point_val
         if std_unit_risk <= 0:
-            return float(self.quantity), f"{self.quantity} {clean_sym}"
+            lots = max(1, int(self.quantity))
+            return float(lots), f"{lots} {clean_sym}", lots, clean_sym
 
         low_std = int(target_risk // std_unit_risk)
         high_std = low_std + 1
@@ -1020,15 +1015,25 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
 
         chosen_std: Optional[int] = None
         if low_std >= 1 and low_std_risk > min_acceptable_risk:
-            if high_std_risk <= max_acceptable_risk and abs(high_std_risk - target_risk) < abs(low_std_risk - target_risk):
+            if high_std_risk <= max_acceptable_risk and abs(high_std_risk - target_risk) < abs(
+                low_std_risk - target_risk
+            ):
                 chosen_std = high_std
             else:
                 chosen_std = low_std
         elif high_std >= 1 and high_std_risk <= max_acceptable_risk and high_std_risk > min_acceptable_risk:
             chosen_std = high_std
 
-        if chosen_std is not None:
-            return float(chosen_std), f"{chosen_std} {clean_sym}"
+        # Ensure standard contract count can support whole-contract partial exits on TradingView
+        if chosen_std is not None and chosen_std > num_partials:
+            if num_partials == 2:
+                tp1_l = max(1, int(round(chosen_std * self.partial_cut_pct)))
+                tp2_l = max(1, int(round(chosen_std * self.partial_cut_pct)))
+                full_l = chosen_std - tp1_l - tp2_l
+                if full_l >= tp1_l:
+                    return float(chosen_std), f"{chosen_std} {clean_sym}", chosen_std, clean_sym
+            else:
+                return float(chosen_std), f"{chosen_std} {clean_sym}", chosen_std, clean_sym
 
         # Fallback to Micro contracts (MES = 0.1 ES, MNQ = 0.1 NQ)
         micro_sym = f"M{clean_sym}" if not clean_sym.startswith("M") else clean_sym
@@ -1041,7 +1046,9 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         high_micro_risk = high_micro * micro_unit_risk
 
         if low_micro >= 1 and low_micro_risk > min_acceptable_risk:
-            if high_micro_risk <= max_acceptable_risk and abs(high_micro_risk - target_risk) < abs(low_micro_risk - target_risk):
+            if high_micro_risk <= max_acceptable_risk and abs(high_micro_risk - target_risk) < abs(
+                low_micro_risk - target_risk
+            ):
                 chosen_micro = high_micro
             else:
                 chosen_micro = low_micro
@@ -1050,15 +1057,22 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         else:
             chosen_micro = max(1, low_micro)
 
-        # 1 Micro contract = 0.1 Standard contract equivalent for PnL math
+        # TradingView 3-target whole-contract rule: avoid 2/2/2 equal split on 6 MNQ when 7 MNQ (2/2/3) keeps FullTP majority
+        if num_partials == 2 and chosen_micro >= 3:
+            tp1_m = max(1, int(round(chosen_micro * self.partial_cut_pct)))
+            tp2_m = max(1, int(round(chosen_micro * self.partial_cut_pct)))
+            full_m = chosen_micro - tp1_m - tp2_m
+            if full_m <= tp1_m and (chosen_micro + 1) * micro_unit_risk <= target_risk * 1.20:
+                chosen_micro += 1
+
         std_equiv_qty = round(chosen_micro * 0.10, 2)
-        return std_equiv_qty, f"{chosen_micro} {micro_sym}"
+        return std_equiv_qty, f"{chosen_micro} {micro_sym}", chosen_micro, micro_sym
 
     def on_bar(
-        self,
-        ctx: BarContext,
-        broker: SimulatedBroker,
-        portfolio: Portfolio,
+            self,
+            ctx: BarContext,
+            broker: SimulatedBroker,
+            portfolio: Portfolio,
     ) -> None:
         if portfolio.has_open_position(ctx.symbol):
             self._manage_open_position(ctx, broker, portfolio)
@@ -1144,14 +1158,18 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         has_htf_bull_smt = any(str(ev.get("timeframe", "")) in ("1h", "4h") for ev in bull_smts)
         has_htf_bear_smt = any(str(ev.get("timeframe", "")) in ("1h", "4h") for ev in bear_smts)
 
-        has_5m_and_1m_bull_smt = (
-            any(str(ev.get("timeframe", "")).startswith("5m") for ev in bull_smts)
-            and any(str(ev.get("timeframe", "")).startswith("1m") for ev in bull_smts)
-        )
-        has_5m_and_1m_bear_smt = (
-            any(str(ev.get("timeframe", "")).startswith("5m") for ev in bear_smts)
-            and any(str(ev.get("timeframe", "")).startswith("1m") for ev in bear_smts)
-        )
+        bull_tfs = {
+            tf for ev in bull_smts
+            for tf in ev.get("all_timeframes", {str(ev.get("timeframe", ""))})
+        }
+        bear_tfs = {
+            tf for ev in bear_smts
+            for tf in ev.get("all_timeframes", {str(ev.get("timeframe", ""))})
+        }
+        has_5m_and_1m_bull_smt = any(tf.startswith("5m") for tf in bull_tfs) and any(
+            tf.startswith("1m") for tf in bull_tfs)
+        has_5m_and_1m_bear_smt = any(tf.startswith("5m") for tf in bear_tfs) and any(
+            tf.startswith("1m") for tf in bear_tfs)
 
         trend_5m = ctx.htf_trends.get("5min", "NEUTRAL")
         t_4h = ctx.htf_trends.get("4h", "NEUTRAL")
@@ -1162,19 +1180,39 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         sec_1h = ctx.sec_htf_trends.get("1h", t_1h)
         sec_15m = ctx.sec_htf_trends.get("15min", t_15m)
 
+        ny_open_ts = ctx.timestamp.replace(hour=9, minute=30, second=0, microsecond=0)
+        overhead_htf_bsl_pools = [
+            tp for tp in ctx.target_pools
+            if tp["pool_type"] == "BSL"
+               and float(tp["price"]) > price
+               and any(
+                k in str(tp["target_type"]).upper() for k in ("4H_POOL", "EQUAL_HL_4H", "1H_POOL", "EQUAL_HL_1H"))
+               and tp.get("creation_time", ny_open_ts) < ny_open_ts
+        ]
+        has_recent_overhead_htf_bsl = any(
+            (ctx.timestamp - tp["creation_time"]) <= pd.Timedelta(days=30)
+            for tp in overhead_htf_bsl_pools
+            if "creation_time" in tp
+        )
+        has_close_overhead_htf_bsl = any(
+            (float(tp["price"]) - price) <= (15.0 if ctx.symbol == "ES" else 120.0)
+            for tp in overhead_htf_bsl_pools
+        )
+        is_true_ath_overhead = (not has_recent_overhead_htf_bsl) and (not has_close_overhead_htf_bsl)
+
         is_ath_bullish_regime = (
-            ctx.htf_trends.get("ath_regime") == "ACTIVE"
-            and t_4h == "BULLISH"
-            and t_1h == "BULLISH"
-            and t_15m == "BULLISH"
-            and sec_4h == "BULLISH"
-            and sec_1h == "BULLISH"
-            and sec_15m == "BULLISH"
+                ctx.htf_trends.get("ath_regime") == "ACTIVE"
+                and is_true_ath_overhead
+                and t_4h == "BULLISH"
+                and t_1h == "BULLISH"
+                and t_15m == "BULLISH"
+                and sec_4h == "BULLISH"
+                and sec_1h == "BULLISH"
+                and sec_15m == "BULLISH"
         )
 
         all_active_smt_descriptions = [ev["description"] for ev in ctx.recent_smt_events]
 
-        ny_open_ts = ctx.timestamp.replace(hour=9, minute=30, second=0, microsecond=0)
         rth_df = ctx.history_df[ctx.history_df.index >= ny_open_ts]
         rth_high = float(rth_df["high"].max()) if not rth_df.empty else price
         rth_low = float(rth_df["low"].min()) if not rth_df.empty else price
@@ -1187,9 +1225,9 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
             sec_htf_aligned_count = sum(1 for b in (sec_4h, sec_1h, sec_15m) if b == wanted_bias)
             has_dir_htf_smt = has_htf_bull_smt if direction == "LONG" else has_htf_bear_smt
             has_cross_index_htf_smt_alignment = (
-                htf_aligned_count >= 1
-                and sec_htf_aligned_count >= 2
-                and has_dir_htf_smt
+                    htf_aligned_count >= 1
+                    and sec_htf_aligned_count >= 2
+                    and has_dir_htf_smt
             )
 
             is_synthetic_short_df = len(ctx.history_df) < 25
@@ -1197,17 +1235,19 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
             dir_taken_pools = ctx.session_taken_by_dir.get(direction, ctx.session_taken_pools)
             has_dir_intraday_smt = intraday_bull_smt if direction == "LONG" else intraday_bear_smt
             allow_or_target = (
-                (has_5m_and_1m_bull_smt if direction == "LONG" else has_5m_and_1m_bear_smt)
-                and htf_aligned_count >= 2
+                    (has_5m_and_1m_bull_smt if direction == "LONG" else has_5m_and_1m_bear_smt)
+                    and htf_aligned_count >= 2
             )
 
             if direction == "LONG":
                 has_catalyst = ssl_swept or bullish_smt or htf_aligned_count >= 2
-                is_5m_trend_aligned = (trend_5m == "BULLISH" and (htf_aligned_count >= 1 or bullish_smt or is_synthetic_short_df))
+                is_5m_trend_aligned = (
+                            trend_5m == "BULLISH" and (htf_aligned_count >= 1 or bullish_smt or is_synthetic_short_df))
                 dir_sweep_details = [d["label"] for d in ssl_details]
             else:
                 has_catalyst = bsl_swept or bearish_smt or htf_aligned_count >= 2
-                is_5m_trend_aligned = (trend_5m == "BEARISH" and (htf_aligned_count >= 1 or bearish_smt or is_synthetic_short_df))
+                is_5m_trend_aligned = (
+                            trend_5m == "BEARISH" and (htf_aligned_count >= 1 or bearish_smt or is_synthetic_short_df))
                 dir_sweep_details = [d["label"] for d in bsl_details]
 
             triggered, retrace_type, retrace_detail, retrace_pts, matching_fvgs, trigger_desc, fail_reason = (
@@ -1264,7 +1304,8 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 retrace_pts=retrace_pts,
             )
             if raw_sl_dist is None:
-                eff_max_sl = max(self.stop_loss_points * 1.6, 102.0) if (ctx.symbol == "NQ" and retrace_pts >= 3) else (self.stop_loss_points * 1.6)
+                eff_max_sl = max(self.stop_loss_points * 1.6, 102.0) if (ctx.symbol == "NQ" and retrace_pts >= 3) else (
+                            self.stop_loss_points * 1.6)
                 self._log_diagnostic(
                     date_str,
                     f"[{t_hm}] {direction} ({trigger_desc}, {retrace_type}) -> Rejected: True structural Stop-Loss "
@@ -1277,13 +1318,13 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
             actual_risk_pts = abs(fill_price - sl_price)
 
             allow_exception_tp1 = (
-                retrace_pts >= 3
-                and dir_exhaustion in ("LOW", "MEDIUM")
-                and (
-                    htf_aligned_count >= 2
-                    or has_cross_index_htf_smt_alignment
-                    or (bullish_smt if direction == "LONG" else bearish_smt)
-                )
+                    retrace_pts >= 3
+                    and dir_exhaustion in ("LOW", "MEDIUM")
+                    and (
+                            htf_aligned_count >= 2
+                            or has_cross_index_htf_smt_alignment
+                            or (bullish_smt if direction == "LONG" else bearish_smt)
+                    )
             )
 
             target_info, target_fail_reason = self._select_best_target(
@@ -1360,8 +1401,33 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 continue
 
             tp_price = target_info["price"]
-            contracts, display_qty_str = self._calculate_contracts(portfolio, ctx.symbol, actual_risk_pts)
+            partial_targets_list = target_info.get("partial_targets", [])
+            contracts, display_qty_str, total_int_lots, unit_sym = self._calculate_contracts(
+                portfolio, ctx.symbol, actual_risk_pts, num_partials=len(partial_targets_list)
+            )
+
+            # Quantize partial exits to exact whole TradingView contracts (e.g., 7 MNQ -> 2 / 2 / 3 MNQ)
+            if len(partial_targets_list) == 1 and total_int_lots >= 2:
+                tp1_lots = max(1, min(total_int_lots - 1, int(round(total_int_lots * self.partial_cut_pct))))
+                partial_targets_list[0]["lots"] = tp1_lots
+                partial_targets_list[0]["unit_sym"] = unit_sym
+                partial_targets_list[0]["weight"] = tp1_lots / float(total_int_lots)
+            elif len(partial_targets_list) == 2 and total_int_lots >= 3:
+                tp1_lots = max(1, int(round(total_int_lots * self.partial_cut_pct)))
+                tp2_lots = max(1, int(round(total_int_lots * self.partial_cut_pct)))
+                if tp1_lots + tp2_lots >= total_int_lots:
+                    tp1_lots = 1
+                    tp2_lots = 1
+                partial_targets_list[0]["lots"] = tp1_lots
+                partial_targets_list[0]["unit_sym"] = unit_sym
+                partial_targets_list[0]["weight"] = tp1_lots / float(total_int_lots)
+                partial_targets_list[1]["lots"] = tp2_lots
+                partial_targets_list[1]["unit_sym"] = unit_sym
+                partial_targets_list[1]["weight"] = tp2_lots / float(total_int_lots)
+
             setup_metadata["display_qty"] = display_qty_str
+            setup_metadata["total_int_lots"] = total_int_lots
+            setup_metadata["unit_sym"] = unit_sym
 
             broker.submit_order(
                 symbol=ctx.symbol,

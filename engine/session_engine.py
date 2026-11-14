@@ -1,5 +1,6 @@
 import pandas as pd
 
+
 def extract_session_liquidity(df_1m: pd.DataFrame) -> list:
     """
     Extracts the absolute ONE high and ONE low per trading session
@@ -18,8 +19,8 @@ def extract_session_liquidity(df_1m: pd.DataFrame) -> list:
             session_pools.append({'session': 'Asia', 'type': 'BSL', 'price': asia_data['high'].max(), 'time': asia_data['high'].idxmax()})
             session_pools.append({'session': 'Asia', 'type': 'SSL', 'price': asia_data['low'].min(), 'time': asia_data['low'].idxmin()})
 
-        # 2. LONDON (03:00 to 09:29)
-        london_data = group.between_time('03:00', '09:29')
+        # 2. LONDON (03:00 to 08:59 — strictly before 09:00 NY)
+        london_data = group.between_time('03:00', '08:59')
         if not london_data.empty:
             session_pools.append({'session': 'London', 'type': 'BSL', 'price': london_data['high'].max(), 'time': london_data['high'].idxmax()})
             session_pools.append({'session': 'London', 'type': 'SSL', 'price': london_data['low'].min(), 'time': london_data['low'].idxmin()})

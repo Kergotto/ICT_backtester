@@ -20,6 +20,7 @@ from domain.smt import (
     is_smt_active_at,
     resample_tv_timeframe,
     detect_htf_swings,
+    _augment_4h_leg_origin_swings,
 )
 from engine.session_engine import extract_session_liquidity
 from engine.portfolio import Portfolio, TradeRecord
@@ -519,7 +520,7 @@ class BacktestEngine:
                 return (creation_time + pd.Timedelta(days=1)).replace(hour=3, minute=0, second=0, microsecond=0)
             return creation_time.replace(hour=3, minute=0, second=0, microsecond=0)
         if "LONDON" in s_up:
-            return creation_time.replace(hour=9, minute=30, second=0, microsecond=0)
+            return creation_time.replace(hour=9, minute=0, second=0, microsecond=0)
         return creation_time + pd.Timedelta(minutes=5)
 
     @staticmethod
@@ -692,8 +693,16 @@ class BacktestEngine:
                 ):
                     df_htf = resample_tv_timeframe(df_htf_src, tf_rule)
                     if len(df_htf) >= 3:
-                        sw_for_liq = detect_htf_swings(df_htf)
-                        sw_htf = sw_for_liq if tf_rule == "4h" else detect_swings(df_htf)
+                        base_htf_sw = detect_htf_swings(df_htf)
+                        if tf_rule == "4h":
+                            aug_4h = _augment_4h_leg_origin_swings(df_htf, base_htf_sw)
+                            sw_for_liq = [
+                                s for s in aug_4h
+                                if s in base_htf_sw or s["time"] < times[0]
+                            ]
+                        else:
+                            sw_for_liq = base_htf_sw
+                        sw_htf = base_htf_sw if tf_rule == "4h" else detect_swings(df_htf)
                         sw_for_struct = (
                             self._filter_1h_structural_swings(df_htf, sw_htf)
                             if tf_rule == "1h"
@@ -957,6 +966,24 @@ class BacktestEngine:
                                     df_nq_1m=df_nq_base,
                                 )
                             )
+                deduped_smt: List[Dict[str, Any]] = []
+                by_sweep_sig: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+                for ev in sorted(smt_events, key=lambda x: x.get("confirmation_close_time", x["time"])):
+                    sig = (
+                        ev.get("type"),
+                        ev["time"].date(),
+                        round(float(ev.get("swept_level", 0.0)), 2),
+                        round(float(ev.get("sweep_extreme", 0.0)), 2),
+                    )
+                    if sig[2] != 0.0 and sig in by_sweep_sig:
+                        existing_ev = by_sweep_sig[sig]
+                        tfs = existing_ev.setdefault("all_timeframes", {str(existing_ev.get("timeframe", ""))})
+                        tfs.add(str(ev.get("timeframe", "")))
+                        continue
+                    ev["all_timeframes"] = {str(ev.get("timeframe", ""))}
+                    by_sweep_sig[sig] = ev
+                    deduped_smt.append(ev)
+                smt_events = sorted(deduped_smt, key=lambda x: x["time"])
                 BacktestEngine._GLOBAL_SMT_CACHE[smt_key] = smt_events
 
         elapsed = pytime.perf_counter() - t0

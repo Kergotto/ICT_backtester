@@ -167,7 +167,7 @@ def _slice_date_range(
     df: pd.DataFrame,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    htf_lookback_days: int = 60,
+    htf_lookback_days: int = 125,
 ) -> pd.DataFrame:
     full_df = df
     start_ts: Optional[pd.Timestamp] = None
@@ -210,10 +210,11 @@ def _find_databento_csv_files(data_path: Path, databento_csv_name: Optional[str]
 
 
 def load_databento_pair(
-    data_dir: str | Path = "data",
+    data_dir: Path,
     databento_csv_name: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    htf_lookback_days: int = 125,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     data_path = Path(data_dir)
     es_badj_pq = data_path / "es_1m_databento_badj.parquet"
@@ -270,7 +271,10 @@ def load_databento_pair(
         else:
             raise FileNotFoundError("Could not find valid NQ data.")
 
-    return _slice_date_range(df_es, start_date, end_date), _slice_date_range(df_nq, start_date, end_date)
+    return (
+        _slice_date_range(df_es, start_date, end_date, htf_lookback_days=htf_lookback_days),
+        _slice_date_range(df_nq, start_date, end_date, htf_lookback_days=htf_lookback_days),
+    )
 
 
 def load_historical_data(
