@@ -260,6 +260,86 @@ class BacktestEngine:
         return filtered
 
     @staticmethod
+    def _apply_4h_pullback_structure_breaks(df_4h: pd.DataFrame) -> None:
+        """
+        Detects 4H structural breaks where a bullish 4H rejection candle (e.g. Oct 7 18:00 @ 7845.25)
+        sweeps the prior 4H candle's low and closes bullish, and the immediately following 4H candle
+        (Oct 7 22:00) reverses and closes below that 4H pullback low.
+        """
+        if df_4h.empty or "trend" not in df_4h.columns or len(df_4h) < 4:
+            return
+
+        opens = df_4h["open"].to_numpy(dtype=float)
+        highs = df_4h["high"].to_numpy(dtype=float)
+        lows = df_4h["low"].to_numpy(dtype=float)
+        closes = df_4h["close"].to_numpy(dtype=float)
+        trends = df_4h["trend"].to_numpy(dtype=int).copy()
+        choch_bull = df_4h["choch_bullish"].to_numpy(dtype=bool)
+        bos_bull = df_4h["bos_bullish"].to_numpy(dtype=bool)
+
+        override_bearish = False
+        anchor_high = 0.0
+
+        for k in range(3, len(df_4h)):
+            if override_bearish:
+                if closes[k] > anchor_high or choch_bull[k] or bos_bull[k]:
+                    override_bearish = False
+                else:
+                    trends[k] = -1
+
+            if not override_bearish and trends[k] == 1:
+                if (
+                        highs[k - 2] > highs[k - 3]
+                        and lows[k - 2] > lows[k - 3]
+                        and lows[k - 3] < lows[k - 1] < lows[k - 2]
+                        and closes[k - 1] > opens[k - 1]
+                        and highs[k - 1] <= highs[k - 2]
+                        and highs[k] <= highs[k - 2]
+                        and closes[k] < lows[k - 1]
+                ):
+                    override_bearish = True
+                    anchor_high = float(max(highs[k - 2], highs[k - 1]))
+                    trends[k] = -1
+
+        df_4h["trend"] = trends
+
+    @staticmethod
+    def _filter_4h_structural_swings(
+            df_4h: pd.DataFrame, swings: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Ensures a minor upper wick in the middle of 3 consecutive ascending bullish 4H candles
+        (e.g. NQ 4H on 2026-10-20 10:00 -> 14:00 -> 18:00) is not treated as a bearish SwingHigh,
+        so 4H only flips BULLISH if price closes above the true 4H SwingHigh (29983.50).
+        """
+        if df_4h.empty or len(df_4h) < 4 or not swings:
+            return swings
+
+        opens = df_4h["open"].to_numpy(dtype=float)
+        highs = df_4h["high"].to_numpy(dtype=float)
+        lows = df_4h["low"].to_numpy(dtype=float)
+        closes = df_4h["close"].to_numpy(dtype=float)
+        times = df_4h.index
+
+        filtered: List[Dict[str, Any]] = []
+        for s in swings:
+            idx = int(times.searchsorted(s["time"]))
+            if 1 <= idx < len(df_4h) - 2 and times[idx] == s["time"]:
+                if s["type"] == "SwingHigh":
+                    if (
+                            closes[idx - 1] > opens[idx - 1]
+                            and closes[idx] > opens[idx]
+                            and closes[idx + 1] > opens[idx + 1]
+                            and closes[idx + 2] > opens[idx + 2]
+                            and closes[idx - 1] < closes[idx] < closes[idx + 1] < closes[idx + 2]
+                            and lows[idx - 1] < lows[idx] < lows[idx + 1] < lows[idx + 2]
+                            and highs[idx + 2] > highs[idx]
+                    ):
+                        continue
+            filtered.append(s)
+        return filtered
+
+    @staticmethod
     def _group_macros(macro_pools: List[Dict[str, Any]]) -> Dict[pd.Timestamp, List[Dict[str, Any]]]:
         grouped: Dict[pd.Timestamp, List[Dict[str, Any]]] = {}
         for pool in macro_pools:
@@ -687,9 +767,9 @@ class BacktestEngine:
                     fib_ranges_5m = track_fibonacci_ranges(df_5m, swings_5m)
 
                 for tf_rule, tf_min, tier_num, is_major in (
-                    ("4h", 240, 1, True),
-                    ("1h", 60, 1, True),
-                    ("15min", 15, 2, False),
+                        ("4h", 240, 1, True),
+                        ("1h", 60, 1, True),
+                        ("15min", 15, 2, False),
                 ):
                     df_htf = resample_tv_timeframe(df_htf_src, tf_rule)
                     if len(df_htf) >= 3:
@@ -703,18 +783,17 @@ class BacktestEngine:
                         else:
                             sw_for_liq = base_htf_sw
                         sw_htf = base_htf_sw if tf_rule == "4h" else detect_swings(df_htf)
-                        sw_for_struct = (
-                            self._filter_1h_structural_swings(df_htf, sw_htf)
-                            if tf_rule == "1h"
-                            else sw_htf
-                        )
+                        if tf_rule == "1h":
+                            sw_for_struct = self._filter_1h_structural_swings(df_htf, sw_htf)
+                        elif tf_rule == "4h":
+                            sw_for_struct = self._filter_4h_structural_swings(df_htf, sw_htf)
+                        else:
+                            sw_for_struct = sw_htf
                         fvgs_htf = track_fvgs(df_htf)
                         st_htf = detect_structure(
                             df_htf, self._shift_swings_for_structure(df_htf, sw_for_struct)
                         )
                         if tf_rule != "4h":
-                            # On 1H, pass 3-bar pivots (`sw_for_liq`) filtered for major legs to `_extract_structure_events`
-                            # so 3-bar range lows (like 09-30 20:00 @ 30724.75 on NQ) anchor the last FVG of the range!
                             sw_for_ifvg = (
                                 self._filter_1h_structural_swings(df_htf, sw_for_liq)
                                 if tf_rule == "1h"
@@ -723,6 +802,8 @@ class BacktestEngine:
                             self._extract_structure_events(
                                 st_htf, tf_minutes=tf_min, swings=sw_for_ifvg, fvgs=fvgs_htf
                             )
+                        else:
+                            self._apply_4h_pullback_structure_breaks(st_htf)
                         struct_df_by_tf[tf_rule] = (
                             st_htf,
                             st_htf.index + pd.Timedelta(minutes=tf_min - 1),
@@ -732,10 +813,10 @@ class BacktestEngine:
                         confirm_lag = pd.Timedelta(minutes=tf_min * 2 - 1)
                         candle_close_lag = pd.Timedelta(minutes=tf_min - 1)
 
-                        raw_htf_candidates: List[Tuple[LiquidityPool, float, pd.Timestamp]] = []
+                        raw_htf_candidates: List[Tuple[LiquidityPool, float, pd.Timestamp, bool]] = []
                         for p in liq_htf.get_all_pools():
                             p_price = self._get_pool_price(p)
-                            raw_htf_candidates.append((p, p_price, p.creation_time))
+                            raw_htf_candidates.append((p, p_price, p.creation_time, False))
 
                             scan_start_ts = p.creation_time + candle_close_lag
                             _, res_ts = self._compute_1m_pool_resolution(
@@ -745,11 +826,11 @@ class BacktestEngine:
                                 matching_later_swings = [
                                     sw for sw in sw_for_liq
                                     if (
-                                        (p.pool_type == "SSL" and sw["type"] == "SwingLow")
-                                        or (p.pool_type == "BSL" and sw["type"] == "SwingHigh")
-                                    )
-                                    and p.creation_time < sw["time"] <= res_ts
-                                    and abs(float(sw["price"]) - p_price) <= dedup_price_tol
+                                               (p.pool_type == "SSL" and sw["type"] == "SwingLow")
+                                               or (p.pool_type == "BSL" and sw["type"] == "SwingHigh")
+                                       )
+                                       and p.creation_time < sw["time"] <= res_ts
+                                       and abs(float(sw["price"]) - p_price) <= dedup_price_tol
                                 ]
                                 if matching_later_swings:
                                     latest_sw = matching_later_swings[-1]
@@ -762,9 +843,53 @@ class BacktestEngine:
                                         touches=p.touches,
                                         source="Structural",
                                     )
-                                    raw_htf_candidates.append((new_pool, sw_p, latest_sw["time"]))
+                                    raw_htf_candidates.append((new_pool, sw_p, latest_sw["time"], False))
 
-                        for p, p_price, orig_creation_ts in raw_htf_candidates:
+                        # Include 15m pullback-bounce highs (e.g. Oct 8 02:00 @ 7845.25 -> 7845.00 pool)
+                        # where a 15m candle rallies above the prior bearish 15m close and is higher than the next two 15m bars.
+                        if tf_rule == "15min" and len(df_htf) >= 5:
+                            h_15 = df_htf["high"].to_numpy(dtype=float)
+                            l_15 = df_htf["low"].to_numpy(dtype=float)
+                            o_15 = df_htf["open"].to_numpy(dtype=float)
+                            c_15 = df_htf["close"].to_numpy(dtype=float)
+                            t_15 = df_htf.index
+                            for k_15 in range(1, len(df_htf) - 2):
+                                if t_15[k_15] < times[0]:
+                                    continue
+                                if (
+                                        c_15[k_15 - 1] < o_15[k_15 - 1]
+                                        and h_15[k_15] > c_15[k_15 - 1]
+                                        and h_15[k_15] > h_15[k_15 + 1]
+                                        and h_15[k_15] > h_15[k_15 + 2]
+                                ):
+                                    sw_p = float(h_15[k_15])
+                                    new_pool = LiquidityPool(
+                                        pool_type="BSL",
+                                        lower_bound=sw_p - 0.25,
+                                        upper_bound=sw_p + 0.25,
+                                        creation_time=t_15[k_15],
+                                        touches=1,
+                                        source="Structural",
+                                    )
+                                    raw_htf_candidates.append((new_pool, sw_p, t_15[k_15], True))
+                                if (
+                                        c_15[k_15 - 1] > o_15[k_15 - 1]
+                                        and l_15[k_15] < c_15[k_15 - 1]
+                                        and l_15[k_15] < l_15[k_15 + 1]
+                                        and l_15[k_15] < l_15[k_15 + 2]
+                                ):
+                                    sw_p = float(l_15[k_15]) + 0.25
+                                    new_pool = LiquidityPool(
+                                        pool_type="SSL",
+                                        lower_bound=sw_p - 0.25,
+                                        upper_bound=sw_p + 0.25,
+                                        creation_time=t_15[k_15],
+                                        touches=1,
+                                        source="Structural",
+                                    )
+                                    raw_htf_candidates.append((new_pool, sw_p, t_15[k_15], True))
+
+                        for p, p_price, orig_creation_ts, is_tp_only in raw_htf_candidates:
                             conf_ts = orig_creation_ts + confirm_lag
                             scan_start_ts = orig_creation_ts + candle_close_lag
 
@@ -778,11 +903,13 @@ class BacktestEngine:
                             for existing in htf_target_catalog:
                                 if existing["pool_type"] == p.pool_type:
                                     if (
-                                        abs(existing["price"] - p_price) <= dedup_price_tol
-                                        and abs((existing["pool"].creation_time - orig_creation_ts).total_seconds()) <= 12 * 3600
+                                            abs(existing["price"] - p_price) <= dedup_price_tol
+                                            and abs((existing[
+                                                         "pool"].creation_time - orig_creation_ts).total_seconds()) <= 12 * 3600
                                     ):
-                                        is_duplicate = True
-                                        break
+                                        if not is_tp_only or existing.get("first_touch_time") is None:
+                                            is_duplicate = True
+                                            break
                             if is_duplicate:
                                 continue
 
@@ -802,6 +929,7 @@ class BacktestEngine:
                                 "target_type": t_type,
                                 "tier": effective_tier,
                                 "is_major_exhaustion_pool": is_major,
+                                "is_target_only_pool": is_tp_only,
                                 "confirm_time": conf_ts,
                                 "first_touch_type": res_type,
                                 "first_touch_time": res_ts,
@@ -1089,6 +1217,8 @@ class BacktestEngine:
                         sweeps_by_time.setdefault(ev_ts, []).append((pool, lbl))
 
         for item in htf_target_catalog:
+            if item.get("is_target_only_pool", False):
+                continue
             res_ts = item.get("first_touch_time")
             res_type = item.get("first_touch_type")
             if res_ts is not None and res_type in ("SWEEP", "BREAK"):

@@ -96,14 +96,14 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         return 3
 
     def _select_best_target(
-        self,
-        ctx: BarContext,
-        direction: str,
-        fill_price: float,
-        actual_risk_pts: float,
-        tick_size: float,
-        allow_opening_range_target: bool = False,
-        allow_exception_tp1: bool = False,
+            self,
+            ctx: BarContext,
+            direction: str,
+            fill_price: float,
+            actual_risk_pts: float,
+            tick_size: float,
+            allow_opening_range_target: bool = False,
+            allow_exception_tp1: bool = False,
     ) -> Tuple[Optional[Dict[str, Any]], str]:
         front_run = self.front_run_ticks * tick_size
         all_directional_targets: List[Dict[str, Any]] = []
@@ -111,7 +111,8 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         # 1. Unfilled Weekend Gaps (Priority 1)
         for gap in ctx.active_weekend_gaps:
             if direction == "LONG" and gap.lower_bound > fill_price:
-                for bound_price, label in ((gap.lower_bound, "WEEKEND_GAP_START"), (gap.upper_bound, "WEEKEND_GAP_FILL")):
+                for bound_price, label in (
+                (gap.lower_bound, "WEEKEND_GAP_START"), (gap.upper_bound, "WEEKEND_GAP_FILL")):
                     adj_tp = bound_price - front_run
                     rr = (adj_tp - fill_price) / actual_risk_pts if actual_risk_pts > 0 else 0.0
                     all_directional_targets.append({
@@ -122,7 +123,8 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                         "priority": 1,
                     })
             elif direction == "SHORT" and gap.upper_bound < fill_price:
-                for bound_price, label in ((gap.upper_bound, "WEEKEND_GAP_START"), (gap.lower_bound, "WEEKEND_GAP_FILL")):
+                for bound_price, label in (
+                (gap.upper_bound, "WEEKEND_GAP_START"), (gap.lower_bound, "WEEKEND_GAP_FILL")):
                     adj_tp = bound_price + front_run
                     rr = (fill_price - adj_tp) / actual_risk_pts if actual_risk_pts > 0 else 0.0
                     all_directional_targets.append({
@@ -171,8 +173,8 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 post_open_highs = [
                     s for s in ctx.confirmed_swings
                     if s["type"] == "SwingHigh"
-                    and ny_open_ts < s["time"] <= (ctx.timestamp - pd.Timedelta(minutes=6))
-                    and float(s["price"]) > fill_price
+                       and ny_open_ts < s["time"] <= (ctx.timestamp - pd.Timedelta(minutes=6))
+                       and float(s["price"]) > fill_price
                 ]
                 if post_open_highs:
                     best_sh = max(post_open_highs, key=lambda x: x["price"])
@@ -189,8 +191,8 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 post_open_lows = [
                     s for s in ctx.confirmed_swings
                     if s["type"] == "SwingLow"
-                    and ny_open_ts < s["time"] <= (ctx.timestamp - pd.Timedelta(minutes=6))
-                    and float(s["price"]) < fill_price
+                       and ny_open_ts < s["time"] <= (ctx.timestamp - pd.Timedelta(minutes=6))
+                       and float(s["price"]) < fill_price
                 ]
                 if post_open_lows:
                     best_sl = min(post_open_lows, key=lambda x: x["price"])
@@ -205,7 +207,8 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                     })
 
         eff_tp1_min_rr = 0.55 if allow_exception_tp1 else self.min_tp1_rr
-        full_tp_min_rr = 1.60 if allow_exception_tp1 else (max(1.65, self.min_rr) if self.enable_partials else self.min_rr)
+        full_tp_min_rr = 1.60 if allow_exception_tp1 else (
+            max(1.65, self.min_rr) if self.enable_partials else self.min_rr)
 
         prio1_targets = [c for c in all_directional_targets if c["priority"] == 1 and c["rr"] >= 0.25]
         if prio1_targets:
@@ -225,7 +228,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 further_cands = [
                     c for c in all_directional_targets
                     if c["priority"] <= 2
-                    and (tp1_cand["rr"] + 0.35) <= c["rr"] <= self.max_rr
+                       and (tp1_cand["rr"] + 0.35) <= c["rr"] <= self.max_rr
                 ]
                 further_cands.sort(key=lambda x: (x["rr"], x["priority"]))
 
@@ -243,7 +246,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 mid_cands = [
                     c for c in further_cands
                     if c["priority"] <= 2
-                    and (tp1_cand["rr"] + 0.35) <= c["rr"] <= (full_tp["rr"] - 0.35)
+                       and (tp1_cand["rr"] + 0.35) <= c["rr"] <= (full_tp["rr"] - 0.35)
                 ]
                 if not mid_cands and tp1_cand["rr"] >= self.min_tp1_rr and full_tp["rr"] <= 2.00:
                     higher_prio1 = [
@@ -253,6 +256,19 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                     if higher_prio1:
                         mid_cands = [full_tp]
                         full_tp = dict(higher_prio1[0])
+
+                # If there is a wide gap (>= 1.80R) between TP1 and FullTP (e.g. Oct 8 ES Long: TP1 @ 1.23R -> FullTP @ 3.62R),
+                # look for an intermediate 15m liquidity pool (such as 7845.00 @ 2.46R) to serve as TP2.
+                if not mid_cands and (full_tp["rr"] - tp1_cand["rr"]) >= 1.80:
+                    mid_target_rr = 0.5 * (tp1_cand["rr"] + full_tp["rr"])
+                    mid_15m_cands = [
+                        c for c in all_directional_targets
+                        if "15MIN" in c["target_type"].upper()
+                           and (tp1_cand["rr"] + 0.80) <= c["rr"] <= (full_tp["rr"] - 0.60)
+                    ]
+                    mid_15m_cands.sort(key=lambda x: abs(x["rr"] - mid_target_rr))
+                    if mid_15m_cands:
+                        mid_cands = [mid_15m_cands[0]]
 
                 # If TP1 sacrificed below 0.80R (e.g. 0.57R on Oct 1 NQ Short),
                 # strictly require BOTH a valid TP2 (>= 0.95R) and FullTP (>= 1.60R)!
@@ -286,7 +302,8 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                         "hit": False,
                     })
 
-                if len(partial_list) >= 2 and all(self._target_priority_rank(pt["target_type"]) == 1 for pt in partial_list):
+                if len(partial_list) >= 2 and all(
+                        self._target_priority_rank(pt["target_type"]) == 1 for pt in partial_list):
                     full_tp["priority"] = 1
                     full_tp["tier"] = 1
 
@@ -299,7 +316,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 intermediate_15m = [
                     c for c in all_directional_targets
                     if "15MIN" in c["target_type"].upper()
-                    and 1.00 <= c["rr"] <= (full_tp["rr"] - 0.50)
+                       and 1.00 <= c["rr"] <= (full_tp["rr"] - 0.50)
                 ]
                 intermediate_15m.sort(key=lambda x: x["rr"])
 
@@ -334,7 +351,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 full_tp["partial_targets"] = partial_list
                 return full_tp, ""
 
-        # SINGLE-TP PATH: Closest major target already offers >= 1.60R (e.g., Oct 13 ES @ 2.32R, Oct 14 NQ @ 2.04R)
+        # SINGLE-TP PATH: Closest major target already offers >= 1.60R (e.g., Oct 13 ES @ 2.32R, Oct 14 NQ @ 2.04R, Oct 21 ES @ 1.67R)
         valid_candidates = [
             c for c in all_directional_targets
             if c["priority"] <= 2 and full_tp_min_rr <= c["rr"] <= self.max_rr
@@ -343,6 +360,80 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
             valid_candidates.sort(key=lambda x: (x["priority"], x["rr"]))
             best = dict(valid_candidates[0])
             best["partial_targets"] = []
+
+            def _get_tf_sign(tf_keys: Tuple[str, ...], attr_names: Tuple[str, ...]) -> int:
+                for attr in attr_names:
+                    v = getattr(ctx, attr, None)
+                    if v is not None:
+                        if isinstance(v, (int, float)):
+                            return 1 if v > 0 else (-1 if v < 0 else 0)
+                        if isinstance(v, str):
+                            vu = v.upper()
+                            return 1 if "BULL" in vu else (-1 if "BEAR" in vu else 0)
+                for v_attr in getattr(ctx, "__dict__", {}).values():
+                    if isinstance(v_attr, dict):
+                        for k in tf_keys:
+                            if k in v_attr:
+                                v = v_attr[k]
+                                if isinstance(v, (int, float)):
+                                    return 1 if v > 0 else (-1 if v < 0 else 0)
+                                if isinstance(v, str):
+                                    vu = v.upper()
+                                    return 1 if "BULL" in vu else (-1 if "BEAR" in vu else 0)
+                return 0
+
+            t_4h = _get_tf_sign(("4h", "4H", "4hr"), ("htf_trend_4h", "trend_4h", "htf_4h_trend"))
+            t_1h = _get_tf_sign(("1h", "1H", "1hr"), ("htf_trend_1h", "trend_1h", "htf_1h_trend"))
+            t_15m = _get_tf_sign(("15min", "15m", "15M"),
+                                 ("htf_trend_15m", "htf_trend_15min", "trend_15m", "trend_15min"))
+
+            is_full_counter_htf = (
+                    (direction == "SHORT" and t_4h == 1 and t_1h == 1 and t_15m == 1)
+                    or (direction == "LONG" and t_4h == -1 and t_1h == -1 and t_15m == -1)
+            )
+            if self.enable_partials and is_full_counter_htf and best["rr"] < 2.00:
+                ny_open_ts = ctx.timestamp.replace(hour=9, minute=30, second=0, microsecond=0)
+                or_cutoff_ts = ctx.timestamp - pd.Timedelta(minutes=5)
+                or_df = ctx.history_df[
+                    (ctx.history_df.index >= ny_open_ts) & (ctx.history_df.index <= or_cutoff_ts)
+                    ]
+                post_open_df = ctx.history_df[
+                    (ctx.history_df.index >= ny_open_ts) & (ctx.history_df.index < ctx.timestamp)
+                    ]
+                if not or_df.empty:
+                    if direction == "SHORT":
+                        or_p = float(or_df["low"].min())
+                        or_ts = or_df["low"].idxmin()
+                        after_or_df = post_open_df[post_open_df.index > or_ts]
+                        unbroken_or = after_or_df.empty or float(after_or_df["low"].min()) >= or_p
+                        or_rr = (fill_price - or_p) / actual_risk_pts if actual_risk_pts > 0 else 0.0
+                        if unbroken_or and 0.70 <= or_rr <= 1.00 and (best["rr"] - or_rr) >= 0.80:
+                            best["partial_targets"] = [{
+                                "label": "TP1",
+                                "price": or_p,
+                                "rr": round(float(or_rr), 2),
+                                "weight": self.partial_cut_pct,
+                                "target_type": f"NY_OPENING_RANGE_LOW (SSL @ {or_p:.2f}, formed {or_ts.strftime('%m-%d %H:%M')})",
+                                "tier": 2,
+                                "hit": False,
+                            }]
+                    else:
+                        or_p = float(or_df["high"].max())
+                        or_ts = or_df["high"].idxmax()
+                        after_or_df = post_open_df[post_open_df.index > or_ts]
+                        unbroken_or = after_or_df.empty or float(after_or_df["high"].max()) <= or_p
+                        or_rr = (or_p - fill_price) / actual_risk_pts if actual_risk_pts > 0 else 0.0
+                        if unbroken_or and 0.70 <= or_rr <= 1.00 and (best["rr"] - or_rr) >= 0.80:
+                            best["partial_targets"] = [{
+                                "label": "TP1",
+                                "price": or_p,
+                                "rr": round(float(or_rr), 2),
+                                "weight": self.partial_cut_pct,
+                                "target_type": f"NY_OPENING_RANGE_HIGH (BSL @ {or_p:.2f}, formed {or_ts.strftime('%m-%d %H:%M')})",
+                                "tier": 2,
+                                "hit": False,
+                            }]
+
             return best, ""
 
         if len(ctx.history_df) < 25:
@@ -370,10 +461,10 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         return None, "No unbroken Session/HTF target pools remaining ahead in trade direction."
 
     def _manage_open_position(
-        self,
-        ctx: BarContext,
-        broker: SimulatedBroker,
-        portfolio: Portfolio,
+            self,
+            ctx: BarContext,
+            broker: SimulatedBroker,
+            portfolio: Portfolio,
     ) -> None:
         if not self.enable_trailing_sl:
             return
@@ -404,21 +495,21 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
             pe.get("label") == "TP2" and pe["time"] < ctx.timestamp
             for pe in pos.partial_exits
         )
+        already_trailed_once = abs(pos.stop_loss - pos.initial_stop_loss) > 1e-9
 
         wanted_struct_dir = "BULLISH" if pos.direction == "LONG" else "BEARISH"
         opposite_struct_dir = "BEARISH" if pos.direction == "LONG" else "BULLISH"
 
         # 1. Straight-expansion Break-Even protection ONLY on single-TP trades (when >= 80% toward FullTP)
         has_planned_partials = len(pos.partial_targets) > 0
-        if not has_planned_partials and progress_to_full_tp >= 0.80 and abs(
-            pos.stop_loss - pos.initial_stop_loss
-        ) < 1e-9:
+        if not has_planned_partials and progress_to_full_tp >= 0.80 and not already_trailed_once:
             if pos.direction == "LONG":
                 be_swings = [
                     s for s in ctx.confirmed_swings
                     if s["type"] == "SwingLow"
-                    and s["time"] >= pos.entry_time
-                    and (pos.entry_price - 0.15 * risk_pts) <= float(s["price"]) <= (pos.entry_price + 0.35 * risk_pts)
+                       and s["time"] >= pos.entry_time
+                       and (pos.entry_price - 0.15 * risk_pts) <= float(s["price"]) <= (
+                                   pos.entry_price + 0.35 * risk_pts)
                 ]
                 if be_swings:
                     best_be = max(be_swings, key=lambda x: x["time"])
@@ -433,8 +524,9 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 be_swings = [
                     s for s in ctx.confirmed_swings
                     if s["type"] == "SwingHigh"
-                    and s["time"] >= pos.entry_time
-                    and (pos.entry_price - 0.35 * risk_pts) <= float(s["price"]) <= (pos.entry_price + 0.15 * risk_pts)
+                       and s["time"] >= pos.entry_time
+                       and (pos.entry_price - 0.35 * risk_pts) <= float(s["price"]) <= (
+                                   pos.entry_price + 0.15 * risk_pts)
                 ]
                 if be_swings:
                     best_be = max(be_swings, key=lambda x: x["time"])
@@ -455,12 +547,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 break
 
         last_trail_ts = pos.metadata.get("last_trail_event_time", pos.entry_time)
-
-        if cont_event is None:
-            return
-
-        if cont_event["close_time"] <= last_trail_ts:
-            return
+        last_trailed_pivot_ts = pos.metadata.get("last_trailed_pivot_time", pos.entry_time)
 
         # Advance `window_anchor_ts` to the most recent partial exit (TP1 or TP2) that occurred
         # strictly BEFORE the current bar (`pe["time"] < ctx.timestamp`).
@@ -474,44 +561,159 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
             if last_pe_ts > window_anchor_ts:
                 window_anchor_ts = last_pe_ts
 
+        fvg_type_needed = "BISI" if pos.direction == "LONG" else "SIBI"
+        reclaimed_fvg_origin_ts: Optional[pd.Timestamp] = None
+
+        # Detect when a 1m BISI/SIBI FVG that was inverted during the pullback (e.g. Oct 8 10:14)
+        # is reclaimed by a candle close back across the FVG boundary (e.g. Oct 8 10:18 closing @ 7838.25)
+        if cont_event is None:
+            for rf in getattr(ctx, "recent_fvgs_all", []):
+                if rf.fvg_type != fvg_type_needed or rf.creation_time < (pos.entry_time - pd.Timedelta(minutes=2)):
+                    continue
+                inv_times = [
+                    ev_ts for ev_name, ev_ts, _ in rf.events
+                    if ev_name == "INVERTED" and window_anchor_ts < ev_ts < (ctx.timestamp - pd.Timedelta(minutes=1))
+                ]
+                if not inv_times:
+                    continue
+                inv_ts = inv_times[-1]
+                post_inv_df = ctx.history_df[(ctx.history_df.index > inv_ts) & (ctx.history_df.index < ctx.timestamp)]
+                if len(post_inv_df) < 2:
+                    continue
+                if pos.direction == "LONG":
+                    if float(post_inv_df["close"].max()) < rf.top and ctx.close >= rf.top and ctx.close > ctx.open:
+                        cont_event = {
+                            "time": ctx.timestamp,
+                            "close_time": ctx.timestamp,
+                            "kind": "IFVG_RECLAIM",
+                            "direction": "BULLISH",
+                            "broken_level": float(rf.top),
+                        }
+                        reclaimed_fvg_origin_ts = rf.creation_time - pd.Timedelta(minutes=2)
+                        break
+                else:
+                    if float(
+                            post_inv_df["close"].min()) > rf.bottom and ctx.close <= rf.bottom and ctx.close < ctx.open:
+                        cont_event = {
+                            "time": ctx.timestamp,
+                            "close_time": ctx.timestamp,
+                            "kind": "IFVG_RECLAIM",
+                            "direction": "BEARISH",
+                            "broken_level": float(rf.bottom),
+                        }
+                        reclaimed_fvg_origin_ts = rf.creation_time - pd.Timedelta(minutes=2)
+                        break
+
+        if cont_event is None:
+            return
+
+        if cont_event["close_time"] <= last_trail_ts:
+            return
+
         had_counter_bos = any(
             e["direction"] == opposite_struct_dir and window_anchor_ts < e["close_time"] < cont_event["close_time"]
             for e in recent_1m_events
         )
 
-        fvg_type_needed = "BISI" if pos.direction == "LONG" else "SIBI"
-        had_fvg_inversion = False
-        for rf in getattr(ctx, "recent_fvgs_all", []):
-            if rf.fvg_type == fvg_type_needed and rf.creation_time >= (pos.entry_time - pd.Timedelta(minutes=2)):
-                for ev_name, ev_ts, _ in rf.events:
-                    if ev_name == "INVERTED" and window_anchor_ts < ev_ts < cont_event["close_time"]:
-                        had_fvg_inversion = True
+        had_fvg_inversion = cont_event.get("kind") == "IFVG_RECLAIM"
+        if not had_fvg_inversion:
+            for rf in getattr(ctx, "recent_fvgs_all", []):
+                if rf.fvg_type == fvg_type_needed and rf.creation_time >= (pos.entry_time - pd.Timedelta(minutes=2)):
+                    for ev_name, ev_ts, _ in rf.events:
+                        if ev_name == "INVERTED" and window_anchor_ts < ev_ts < cont_event["close_time"]:
+                            had_fvg_inversion = True
+                            if reclaimed_fvg_origin_ts is None:
+                                reclaimed_fvg_origin_ts = rf.creation_time - pd.Timedelta(minutes=2)
+                            break
+                    if had_fvg_inversion:
                         break
-                if had_fvg_inversion:
-                    break
 
-        window_df = ctx.history_df[ctx.history_df.index > window_anchor_ts]
+        eff_window_start = window_anchor_ts
+        if (
+                reclaimed_fvg_origin_ts is not None
+                and reclaimed_fvg_origin_ts > last_trailed_pivot_ts
+                and reclaimed_fvg_origin_ts < eff_window_start
+        ):
+            eff_window_start = reclaimed_fvg_origin_ts - pd.Timedelta(minutes=1)
+
+        already_trailed_after_tp1 = (
+                tp1_hit
+                and any(pe.get("label") == "TP1" and pe["time"] < last_trail_ts for pe in pos.partial_exits)
+        )
+
+        window_df = ctx.history_df[ctx.history_df.index > eff_window_start]
         if len(window_df) < 2:
             return
 
+        # If we already trailed after TP1 and price rallied to a new interim peak before pulling back
+        # and breaking that peak (e.g. Oct 8 ES Long: 10:18 -> 10:23 peak @ 7842.25 -> 10:27 pullback @ 7838.00 -> 10:28 BOS),
+        # slice the pullback window starting from that interim peak so we trail under the new pullback low (10:27 @ 7838.00).
+        if already_trailed_after_tp1 and cont_event.get("kind") != "IFVG_RECLAIM" and len(window_df) >= 5:
+            prior_sub = window_df.iloc[:-1]
+            if pos.direction == "LONG":
+                peak_ts = prior_sub["high"].idxmax()
+                if peak_ts > window_df.index[1] and peak_ts < prior_sub.index[-1]:
+                    window_df = ctx.history_df[ctx.history_df.index >= peak_ts]
+            else:
+                trough_ts = prior_sub["low"].idxmin()
+                if trough_ts > window_df.index[1] and trough_ts < prior_sub.index[-1]:
+                    window_df = ctx.history_df[ctx.history_df.index >= trough_ts]
+
+        if len(window_df) < 2:
+            return
+
+        w_opens = window_df["open"].to_numpy(dtype=float)
+        w_highs = window_df["high"].to_numpy(dtype=float)
+        w_lows = window_df["low"].to_numpy(dtype=float)
+        w_closes = window_df["close"].to_numpy(dtype=float)
+
         if pos.direction == "LONG":
             pullback_low = float(window_df["low"].min())
-            pullback_time = window_df["low"].idxmin()
+            low_matches = window_df.index[window_df["low"] <= (pullback_low + 1e-9)]
+            if len(low_matches) >= 2 and (low_matches[-1] - low_matches[0]) <= pd.Timedelta(minutes=2):
+                pullback_time = low_matches[-1]
+            else:
+                pullback_time = window_df["low"].idxmin()
+
             prior_swings = [
                 s for s in ctx.confirmed_swings
-                if s["type"] == "SwingLow" and window_anchor_ts <= s["time"] < pullback_time
+                if s["type"] == "SwingLow" and eff_window_start <= s["time"] < pullback_time
             ]
             swept_cluster = sum(1 for s in prior_swings if pullback_low < float(s["price"])) >= 1
             cluster_touches = int((window_df["low"] <= (pullback_low + buffer_pts)).sum())
-            if not (had_counter_bos or had_fvg_inversion or swept_cluster or (tp2_hit_prior and cluster_touches >= 2)):
+
+            had_internal_counter_break = any(
+                w_closes[idx - 1] > w_opens[idx - 1] and w_closes[idx] < w_lows[idx - 1]
+                for idx in range(1, len(window_df) - 1)
+            )
+            valid_second_pre_tp1_trail = (
+                    already_trailed_once and had_internal_counter_break and cluster_touches >= 2
+            )
+            tp1_price = float(pos.partial_exits[0]["price"]) if tp1_hit else pos.entry_price
+            post_tp1_subsequent_trail = (
+                    already_trailed_after_tp1
+                    and (had_fvg_inversion or had_internal_counter_break or swept_cluster or cluster_touches >= 2)
+            )
+
+            if not (
+                    had_counter_bos
+                    or had_fvg_inversion
+                    or swept_cluster
+                    or (tp2_hit_prior and cluster_touches >= 2)
+                    or post_tp1_subsequent_trail
+                    or valid_second_pre_tp1_trail
+            ):
                 return
 
             raw_new_sl = pullback_low if (tp2_hit and cluster_touches >= 2) else (pullback_low - buffer_pts)
             if tp2_hit:
-                tp1_price = float(pos.partial_exits[0]["price"])
                 cand_sl = min(raw_new_sl, tp1_price + 0.15 * risk_pts)
+            elif post_tp1_subsequent_trail:
+                cand_sl = raw_new_sl
             elif tp1_hit or progress_to_full_tp >= 0.75:
                 cand_sl = min(raw_new_sl, pos.entry_price + 0.35 * risk_pts)
+            elif valid_second_pre_tp1_trail and raw_new_sl <= (pos.entry_price + 0.15 * risk_pts):
+                cand_sl = raw_new_sl
             else:
                 if raw_new_sl > pos.entry_price:
                     return
@@ -519,30 +721,60 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
 
             if cand_sl > pos.stop_loss + tick_size and cand_sl < ctx.low - tick_size:
                 if pos.update_stop_loss(
-                    cand_sl,
-                    ctx.timestamp,
-                    f"below {pullback_time.strftime('%H:%M')} retrace cluster low @ {pullback_low:.2f}",
+                        cand_sl,
+                        ctx.timestamp,
+                        f"below {pullback_time.strftime('%H:%M')} retrace cluster low @ {pullback_low:.2f}",
                 ):
                     pos.metadata["last_trail_event_time"] = ctx.timestamp
+                    pos.metadata["last_trailed_pivot_time"] = pullback_time
 
         else:
             pullback_high = float(window_df["high"].max())
-            pullback_time = window_df["high"].idxmax()
+            high_matches = window_df.index[window_df["high"] >= (pullback_high - 1e-9)]
+            if len(high_matches) >= 2 and (high_matches[-1] - high_matches[0]) <= pd.Timedelta(minutes=2):
+                pullback_time = high_matches[-1]
+            else:
+                pullback_time = window_df["high"].idxmax()
+
             prior_swings = [
                 s for s in ctx.confirmed_swings
                 if s["type"] == "SwingHigh" and pos.entry_time <= s["time"] < pullback_time
             ]
             swept_cluster = sum(1 for s in prior_swings if pullback_high > float(s["price"])) >= 1
             cluster_touches = int((window_df["high"] >= (pullback_high - buffer_pts)).sum())
-            if not (had_counter_bos or had_fvg_inversion or swept_cluster or (tp2_hit_prior and cluster_touches >= 2)):
+
+            had_internal_counter_break = any(
+                w_closes[idx - 1] < w_opens[idx - 1] and w_closes[idx] > w_highs[idx - 1]
+                for idx in range(1, len(window_df) - 1)
+            )
+            valid_second_pre_tp1_trail = (
+                    already_trailed_once and had_internal_counter_break and cluster_touches >= 2
+            )
+            tp1_price = float(pos.partial_exits[0]["price"]) if tp1_hit else pos.entry_price
+            post_tp1_subsequent_trail = (
+                    already_trailed_after_tp1
+                    and (had_fvg_inversion or had_internal_counter_break or swept_cluster or cluster_touches >= 2)
+            )
+
+            if not (
+                    had_counter_bos
+                    or had_fvg_inversion
+                    or swept_cluster
+                    or (tp2_hit_prior and cluster_touches >= 2)
+                    or post_tp1_subsequent_trail
+                    or valid_second_pre_tp1_trail
+            ):
                 return
 
             raw_new_sl = pullback_high if (tp2_hit and cluster_touches >= 2) else (pullback_high + buffer_pts)
             if tp2_hit:
-                tp1_price = float(pos.partial_exits[0]["price"])
                 cand_sl = max(raw_new_sl, tp1_price - 0.15 * risk_pts)
+            elif post_tp1_subsequent_trail:
+                cand_sl = raw_new_sl
             elif tp1_hit or progress_to_full_tp >= 0.75:
                 cand_sl = max(raw_new_sl, pos.entry_price - 0.35 * risk_pts)
+            elif valid_second_pre_tp1_trail and raw_new_sl >= (pos.entry_price - 0.15 * risk_pts):
+                cand_sl = raw_new_sl
             else:
                 if raw_new_sl < pos.entry_price:
                     return
@@ -550,11 +782,12 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
 
             if cand_sl < pos.stop_loss - tick_size and cand_sl > ctx.high + tick_size:
                 if pos.update_stop_loss(
-                    cand_sl,
-                    ctx.timestamp,
-                    f"above {pullback_time.strftime('%H:%M')} retrace cluster high @ {pullback_high:.2f}",
+                        cand_sl,
+                        ctx.timestamp,
+                        f"above {pullback_time.strftime('%H:%M')} retrace cluster high @ {pullback_high:.2f}",
                 ):
                     pos.metadata["last_trail_event_time"] = ctx.timestamp
+                    pos.metadata["last_trailed_pivot_time"] = pullback_time
 
     def _evaluate_retracement_and_trigger(
         self,
