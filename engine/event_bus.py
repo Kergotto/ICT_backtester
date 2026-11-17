@@ -1441,6 +1441,8 @@ class BacktestEngine:
                         )
 
                     if is_unbroken:
+                        if item["timeframe"] == "SESSION" and pool_obj.creation_time >= session_start:
+                            continue
                         vis_targets.append({
                             "pool_type": pool_obj.pool_type,
                             "price": p_price,

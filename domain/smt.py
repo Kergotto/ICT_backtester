@@ -1226,6 +1226,9 @@ def detect_session_smt_divergence(
     nq_high_times = [s["time"] for s in nq_highs]
     nq_low_times = [s["time"] for s in nq_lows]
 
+    es_fvgs_1m = track_fvgs(df_es_1m)
+    nq_fvgs_1m = track_fvgs(df_nq_1m)
+
     def _ny_trade_date(ts: pd.Timestamp):
         return (ts + pd.Timedelta(hours=6)).date()
 
@@ -1390,7 +1393,7 @@ def detect_session_smt_divergence(
                 if not (es_swept or nq_swept):
                     continue
 
-                confirm_time, confirm_asset, confirm_level, disrespected = None, None, None, False
+                confirm_time, confirm_asset, confirm_level, confirm_kind, disrespected = None, None, None, "MSS", False
                 for m in range(1, 16):
                     tm = t + pd.Timedelta(minutes=m)
                     e_i = es_times.searchsorted(tm)
@@ -1410,11 +1413,36 @@ def detect_session_smt_divergence(
                     nq_mss = nq_lows[nl_idx]["price"] if nl_idx >= 0 and nq_low_times[nl_idx] >= ny_open else None
 
                     if es_swept and es_mss is not None and es_close_arr[e_i] < es_mss:
-                        confirm_time, confirm_asset, confirm_level = tm, "ES", float(es_mss)
+                        confirm_time, confirm_asset, confirm_level, confirm_kind = tm, "ES", float(es_mss), "MSS"
                         break
                     if nq_swept and nq_mss is not None and nq_close_arr[n_i] < nq_mss:
-                        confirm_time, confirm_asset, confirm_level = tm, "NQ", float(nq_mss)
+                        confirm_time, confirm_asset, confirm_level, confirm_kind = tm, "NQ", float(nq_mss), "MSS"
                         break
+
+                    # Also detect 1m BISI FVG inversion (IFVG_MSS) formed during the manipulation push (e.g. Oct 26 09:37 -> 09:40)
+                    if t <= (ny_open + pd.Timedelta(minutes=15)):
+                        if es_swept:
+                            cand_es_fvgs = [
+                                f for f in es_fvgs_1m
+                                if f.fvg_type == "BISI"
+                                and (ny_open + pd.Timedelta(minutes=4)) <= f.creation_time <= tm - pd.Timedelta(minutes=1)
+                                and es_close_arr[e_i] < f.bottom
+                            ]
+                            if cand_es_fvgs:
+                                inv_lvl = float(min(f.bottom for f in cand_es_fvgs))
+                                confirm_time, confirm_asset, confirm_level, confirm_kind = tm, "ES", inv_lvl, "IFVG_MSS"
+                                break
+                        if nq_swept:
+                            cand_nq_fvgs = [
+                                f for f in nq_fvgs_1m
+                                if f.fvg_type == "BISI"
+                                and (ny_open + pd.Timedelta(minutes=4)) <= f.creation_time <= tm - pd.Timedelta(minutes=1)
+                                and nq_close_arr[n_i] < f.bottom
+                            ]
+                            if cand_nq_fvgs:
+                                inv_lvl = float(min(f.bottom for f in cand_nq_fvgs))
+                                confirm_time, confirm_asset, confirm_level, confirm_kind = tm, "NQ", inv_lvl, "IFVG_MSS"
+                                break
 
                 if not disrespected and confirm_time is not None:
                     es_interv_low = _find_intervening_extreme(es_lows, es_low_times, es_form_ts, t, find_min=True)
@@ -1454,7 +1482,7 @@ def detect_session_smt_divergence(
                     )
                     desc = (
                         f"[{t.strftime('%m-%d %H:%M')}] Bearish SMT (Session_{sess_label}): "
-                        f"{sweeper_str} --> 1m MSS on {confirm_asset} at [{confirm_time.strftime('%m-%d %H:%M')}] (< {confirm_level:.2f}) {status_tag}"
+                        f"{sweeper_str} --> 1m {confirm_kind} on {confirm_asset} at [{confirm_time.strftime('%m-%d %H:%M')}] (< {confirm_level:.2f}) {status_tag}"
                     )
                     events.append({
                         "type": "Bearish_SMT",

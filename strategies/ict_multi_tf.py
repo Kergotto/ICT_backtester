@@ -112,7 +112,9 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         for gap in ctx.active_weekend_gaps:
             if direction == "LONG" and gap.lower_bound > fill_price:
                 for bound_price, label in (
-                (gap.lower_bound, "WEEKEND_GAP_START"), (gap.upper_bound, "WEEKEND_GAP_FILL")):
+                        (gap.lower_bound, "WEEKEND_GAP_START"),
+                        (gap.upper_bound, "WEEKEND_GAP_FILL"),
+                ):
                     adj_tp = bound_price - front_run
                     rr = (adj_tp - fill_price) / actual_risk_pts if actual_risk_pts > 0 else 0.0
                     all_directional_targets.append({
@@ -124,7 +126,9 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                     })
             elif direction == "SHORT" and gap.upper_bound < fill_price:
                 for bound_price, label in (
-                (gap.upper_bound, "WEEKEND_GAP_START"), (gap.lower_bound, "WEEKEND_GAP_FILL")):
+                        (gap.upper_bound, "WEEKEND_GAP_START"),
+                        (gap.lower_bound, "WEEKEND_GAP_FILL"),
+                ):
                     adj_tp = bound_price + front_run
                     rr = (fill_price - adj_tp) / actual_risk_pts if actual_risk_pts > 0 else 0.0
                     all_directional_targets.append({
@@ -208,7 +212,8 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
 
         eff_tp1_min_rr = 0.55 if allow_exception_tp1 else self.min_tp1_rr
         full_tp_min_rr = 1.60 if allow_exception_tp1 else (
-            max(1.65, self.min_rr) if self.enable_partials else self.min_rr)
+            max(1.65, self.min_rr) if self.enable_partials else self.min_rr
+        )
 
         prio1_targets = [c for c in all_directional_targets if c["priority"] == 1 and c["rr"] >= 0.25]
         if prio1_targets:
@@ -303,7 +308,8 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                     })
 
                 if len(partial_list) >= 2 and all(
-                        self._target_priority_rank(pt["target_type"]) == 1 for pt in partial_list):
+                        self._target_priority_rank(pt["target_type"]) == 1 for pt in partial_list
+                ):
                     full_tp["priority"] = 1
                     full_tp["tier"] = 1
 
@@ -351,7 +357,7 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 full_tp["partial_targets"] = partial_list
                 return full_tp, ""
 
-        # SINGLE-TP PATH: Closest major target already offers >= 1.60R (e.g., Oct 13 ES @ 2.32R, Oct 14 NQ @ 2.04R, Oct 21 ES @ 1.67R)
+        # SINGLE-TP PATH: Closest major target already offers >= 1.60R (e.g., Oct 13 ES @ 2.32R, Oct 14 NQ @ 2.04R, Oct 21 ES @ 1.67R, Oct 26 NQ @ 2.35R)
         valid_candidates = [
             c for c in all_directional_targets
             if c["priority"] <= 2 and full_tp_min_rr <= c["rr"] <= self.max_rr
@@ -361,37 +367,10 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
             best = dict(valid_candidates[0])
             best["partial_targets"] = []
 
-            def _get_tf_sign(tf_keys: Tuple[str, ...], attr_names: Tuple[str, ...]) -> int:
-                for attr in attr_names:
-                    v = getattr(ctx, attr, None)
-                    if v is not None:
-                        if isinstance(v, (int, float)):
-                            return 1 if v > 0 else (-1 if v < 0 else 0)
-                        if isinstance(v, str):
-                            vu = v.upper()
-                            return 1 if "BULL" in vu else (-1 if "BEAR" in vu else 0)
-                for v_attr in getattr(ctx, "__dict__", {}).values():
-                    if isinstance(v_attr, dict):
-                        for k in tf_keys:
-                            if k in v_attr:
-                                v = v_attr[k]
-                                if isinstance(v, (int, float)):
-                                    return 1 if v > 0 else (-1 if v < 0 else 0)
-                                if isinstance(v, str):
-                                    vu = v.upper()
-                                    return 1 if "BULL" in vu else (-1 if "BEAR" in vu else 0)
-                return 0
-
-            t_4h = _get_tf_sign(("4h", "4H", "4hr"), ("htf_trend_4h", "trend_4h", "htf_4h_trend"))
-            t_1h = _get_tf_sign(("1h", "1H", "1hr"), ("htf_trend_1h", "trend_1h", "htf_1h_trend"))
-            t_15m = _get_tf_sign(("15min", "15m", "15M"),
-                                 ("htf_trend_15m", "htf_trend_15min", "trend_15m", "trend_15min"))
-
-            is_full_counter_htf = (
-                    (direction == "SHORT" and t_4h == 1 and t_1h == 1 and t_15m == 1)
-                    or (direction == "LONG" and t_4h == -1 and t_1h == -1 and t_15m == -1)
-            )
-            if self.enable_partials and is_full_counter_htf and best["rr"] < 2.00:
+            # When no intermediate Priority-1 pool exists before FullTP (e.g. Oct 26 NQ Short @ 09:40 to 29072.75 @ 2.35R,
+            # or Oct 21 ES Short @ 09:42 to 7757.25 @ 1.67R), check if an unbroken NY Opening Range Low/High sits ahead
+            # with >= 0.80R room to FullTP. Use body closure (min/max of open, close) when >= 0.70R, or wick if body < 0.70R.
+            if self.enable_partials and len(ctx.history_df) >= 25:
                 ny_open_ts = ctx.timestamp.replace(hour=9, minute=30, second=0, microsecond=0)
                 or_cutoff_ts = ctx.timestamp - pd.Timedelta(minutes=5)
                 or_df = ctx.history_df[
@@ -402,12 +381,18 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                     ]
                 if not or_df.empty:
                     if direction == "SHORT":
-                        or_p = float(or_df["low"].min())
                         or_ts = or_df["low"].idxmin()
+                        wick_p = float(or_df["low"].min())
+                        bar = ctx.history_df.loc[or_ts] if or_ts in ctx.history_df.index else None
+                        body_p = float(min(bar["open"], bar["close"])) if bar is not None else wick_p
                         after_or_df = post_open_df[post_open_df.index > or_ts]
-                        unbroken_or = after_or_df.empty or float(after_or_df["low"].min()) >= or_p
-                        or_rr = (fill_price - or_p) / actual_risk_pts if actual_risk_pts > 0 else 0.0
-                        if unbroken_or and 0.70 <= or_rr <= 1.00 and (best["rr"] - or_rr) >= 0.80:
+                        unbroken_or = after_or_df.empty or float(after_or_df["low"].min()) >= wick_p
+
+                        body_rr = (fill_price - body_p) / actual_risk_pts if actual_risk_pts > 0 else 0.0
+                        wick_rr = (fill_price - wick_p) / actual_risk_pts if actual_risk_pts > 0 else 0.0
+                        or_p, or_rr = (body_p, body_rr) if body_rr >= 0.70 else (wick_p, wick_rr)
+
+                        if unbroken_or and 0.70 <= or_rr <= 1.25 and (best["rr"] - or_rr) >= 0.80:
                             best["partial_targets"] = [{
                                 "label": "TP1",
                                 "price": or_p,
@@ -418,12 +403,18 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                                 "hit": False,
                             }]
                     else:
-                        or_p = float(or_df["high"].max())
                         or_ts = or_df["high"].idxmax()
+                        wick_p = float(or_df["high"].max())
+                        bar = ctx.history_df.loc[or_ts] if or_ts in ctx.history_df.index else None
+                        body_p = float(max(bar["open"], bar["close"])) if bar is not None else wick_p
                         after_or_df = post_open_df[post_open_df.index > or_ts]
-                        unbroken_or = after_or_df.empty or float(after_or_df["high"].max()) <= or_p
-                        or_rr = (or_p - fill_price) / actual_risk_pts if actual_risk_pts > 0 else 0.0
-                        if unbroken_or and 0.70 <= or_rr <= 1.00 and (best["rr"] - or_rr) >= 0.80:
+                        unbroken_or = after_or_df.empty or float(after_or_df["high"].max()) <= wick_p
+
+                        body_rr = (body_p - fill_price) / actual_risk_pts if actual_risk_pts > 0 else 0.0
+                        wick_rr = (wick_p - fill_price) / actual_risk_pts if actual_risk_pts > 0 else 0.0
+                        or_p, or_rr = (body_p, body_rr) if body_rr >= 0.70 else (wick_p, wick_rr)
+
+                        if unbroken_or and 0.70 <= or_rr <= 1.25 and (best["rr"] - or_rr) >= 0.80:
                             best["partial_targets"] = [{
                                 "label": "TP1",
                                 "price": or_p,
@@ -610,23 +601,39 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         if cont_event["close_time"] <= last_trail_ts:
             return
 
-        had_counter_bos = any(
-            e["direction"] == opposite_struct_dir and window_anchor_ts < e["close_time"] < cont_event["close_time"]
-            for e in recent_1m_events
-        )
+        # Identify all FVGs of `fvg_type_needed` in the active leg (since `last_trailed_pivot_ts`)
+        # that were still uninverted entering `window_anchor_ts`. Only inverting the LAST (most extreme)
+        # FVG of the leg counts as an FVG trend break to the opposite side.
+        leg_fvgs = [
+            rf for rf in getattr(ctx, "recent_fvgs_all", [])
+            if rf.fvg_type == fvg_type_needed
+               and last_trailed_pivot_ts <= rf.creation_time < cont_event["close_time"]
+               and not any(
+                ev_name == "INVERTED" and ev_ts <= window_anchor_ts
+                for ev_name, ev_ts, _ in rf.events
+            )
+        ]
+        if pos.direction == "LONG":
+            last_fvg_of_leg = min(leg_fvgs, key=lambda f: f.bottom) if leg_fvgs else None
+        else:
+            last_fvg_of_leg = max(leg_fvgs, key=lambda f: f.top) if leg_fvgs else None
 
         had_fvg_inversion = cont_event.get("kind") == "IFVG_RECLAIM"
-        if not had_fvg_inversion:
-            for rf in getattr(ctx, "recent_fvgs_all", []):
-                if rf.fvg_type == fvg_type_needed and rf.creation_time >= (pos.entry_time - pd.Timedelta(minutes=2)):
-                    for ev_name, ev_ts, _ in rf.events:
-                        if ev_name == "INVERTED" and window_anchor_ts < ev_ts < cont_event["close_time"]:
-                            had_fvg_inversion = True
-                            if reclaimed_fvg_origin_ts is None:
-                                reclaimed_fvg_origin_ts = rf.creation_time - pd.Timedelta(minutes=2)
-                            break
-                    if had_fvg_inversion:
-                        break
+        if not had_fvg_inversion and last_fvg_of_leg is not None:
+            for ev_name, ev_ts, _ in last_fvg_of_leg.events:
+                if ev_name == "INVERTED" and window_anchor_ts < ev_ts < cont_event["close_time"]:
+                    had_fvg_inversion = True
+                    if reclaimed_fvg_origin_ts is None:
+                        reclaimed_fvg_origin_ts = last_fvg_of_leg.creation_time - pd.Timedelta(minutes=2)
+                    break
+
+        had_counter_bos = False
+        for e in recent_1m_events:
+            if e["direction"] == opposite_struct_dir and window_anchor_ts < e["close_time"] < cont_event["close_time"]:
+                if e.get("kind") == "IFVG_BOS" and not had_fvg_inversion:
+                    continue
+                had_counter_bos = True
+                break
 
         eff_window_start = window_anchor_ts
         if (
@@ -839,7 +846,10 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 else:
                     dist_from_manipulation = float(recent_6["high"].max()) - ctx.close
 
-                if dist_from_manipulation <= (self.stop_loss_points * 1.5):
+                # Immediate 1m IFVG_BOS on NQ (e.g., Oct 26 09:40) is an impulse reversal entry, not a late chase;
+                # ES keeps the 1.5x cap so ES rejects 09:40 at 12.50 pts and hands the trade to NQ.
+                is_immediate_nq_ifvg = (ctx.symbol == "NQ" and confirm_event.get("kind") == "IFVG_BOS")
+                if is_immediate_nq_ifvg or dist_from_manipulation <= (self.stop_loss_points * 1.5):
                     return (
                         True,
                         "SMT_REVERSAL_MODEL",
