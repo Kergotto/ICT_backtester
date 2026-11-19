@@ -1,6 +1,25 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Any, Optional
+import numpy as np
 import pandas as pd
+
+
+_TWO_MIN_NS: int = 120_000_000_000
+_TWELVE_HR_NS: int = 43_200_000_000_000
+
+
+def _ts_to_ns(ts: Any) -> int:
+    if hasattr(ts, "as_unit"):
+        return int(ts.as_unit("ns").value)
+    if hasattr(ts, "value"):
+        return int(ts.value)
+    return int(pd.Timestamp(ts).as_unit("ns").value)
+
+
+def _index_to_ns(idx: pd.DatetimeIndex) -> np.ndarray:
+    if len(idx) == 0:
+        return np.empty(0, dtype=np.int64)
+    return idx.as_unit("ns").asi8 if hasattr(idx, "as_unit") else idx.asi8
 
 
 @dataclass(slots=True)
@@ -16,6 +35,10 @@ class LiquidityPool:
     source: str = "Standard"
     initial_price: float = field(default=0.0)
     touch_history: List[Tuple[pd.Timestamp, int, float, float]] = field(default_factory=list)
+    _creation_ns: int = field(init=False, repr=False, compare=False)
+    _last_touch_ns: int = field(init=False, repr=False, compare=False)
+    _broken: bool = field(init=False, repr=False, compare=False)
+    _swept: bool = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
         if self.last_touch_time is None:
@@ -24,41 +47,89 @@ class LiquidityPool:
             self.initial_price = self.upper_bound if self.pool_type == 'BSL' else self.lower_bound
         if not self.touch_history:
             self.touch_history.append((self.creation_time, self.touches, self.lower_bound, self.upper_bound))
+        self._creation_ns = _ts_to_ns(self.creation_time)
+        self._last_touch_ns = _ts_to_ns(self.last_touch_time)
+        broken = False
+        swept = False
+        for ev_type, _ in self.events:
+            if ev_type == "BREAK":
+                broken = True
+            elif ev_type == "SWEEP":
+                swept = True
+        self._broken = broken
+        self._swept = swept
 
     @property
     def is_active(self) -> bool:
-        return not any(event_type == "BREAK" for event_type, _ in self.events)
+        if not self.events:
+            return True
+        for event_type, _ in self.events:
+            if event_type == "BREAK":
+                return False
+        return True
 
     @property
     def has_been_swept(self) -> bool:
-        return any(event_type == "SWEEP" for event_type, _ in self.events)
+        if not self.events:
+            return False
+        for event_type, _ in self.events:
+            if event_type == "SWEEP":
+                return True
+        return False
 
     def evaluate_candle(self, high: float, low: float, close: float, timestamp: pd.Timestamp) -> None:
         if not self.is_active or timestamp <= self.creation_time:
             return
+        self._evaluate_candle_fast(high, low, close, timestamp, _ts_to_ns(timestamp))
 
-        if self._is_body_break(close):
-            self.events.append(("BREAK", timestamp))
+    def _evaluate_candle_fast(
+        self, high: float, low: float, close: float, timestamp: pd.Timestamp, ts_ns: int
+    ) -> None:
+        if self._broken or ts_ns <= self._creation_ns:
             return
 
-        if self._is_wick_sweep(high, low, close):
-            if not self.has_been_swept:
-                if self.source != "Macro_Session":
-                    if self.pool_type == 'BSL' and (high - self.upper_bound) <= 2.0:
-                        self.upper_bound = float(max(self.upper_bound, high))
-                    elif self.pool_type == 'SSL' and (self.lower_bound - low) <= 2.0:
-                        self.lower_bound = float(min(self.lower_bound, low))
-            self.events.append(("SWEEP", timestamp))
-            self.touch_history.append((timestamp, self.touches, self.lower_bound, self.upper_bound))
-            return
+        if self.pool_type == 'BSL':
+            ub = self.upper_bound
+            if close > ub:
+                self._broken = True
+                self.events.append(("BREAK", timestamp))
+                return
 
-        if (timestamp - self.creation_time).total_seconds() > 120:
-            if not self.has_been_swept and self._is_partial_mitigation(high, low):
-                if self.pool_type == 'BSL':
-                    self.lower_bound = float(max(self.lower_bound, min(high, self.upper_bound)))
-                elif self.pool_type == 'SSL':
-                    self.upper_bound = float(min(self.upper_bound, max(low, self.lower_bound)))
+            if high > ub:
+                if not self._swept:
+                    if self.source != "Macro_Session" and (high - ub) <= 2.0:
+                        self.upper_bound = float(high)
+                    self._swept = True
+                self.events.append(("SWEEP", timestamp))
                 self.touch_history.append((timestamp, self.touches, self.lower_bound, self.upper_bound))
+                return
+
+            if not self._swept and (ts_ns - self._creation_ns) > _TWO_MIN_NS and high > self.lower_bound:
+                new_lb = high if high < ub else ub
+                if new_lb > self.lower_bound:
+                    self.lower_bound = float(new_lb)
+                self.touch_history.append((timestamp, self.touches, self.lower_bound, ub))
+        else:
+            lb = self.lower_bound
+            if close < lb:
+                self._broken = True
+                self.events.append(("BREAK", timestamp))
+                return
+
+            if low < lb:
+                if not self._swept:
+                    if self.source != "Macro_Session" and (lb - low) <= 2.0:
+                        self.lower_bound = float(low)
+                    self._swept = True
+                self.events.append(("SWEEP", timestamp))
+                self.touch_history.append((timestamp, self.touches, self.lower_bound, self.upper_bound))
+                return
+
+            if not self._swept and (ts_ns - self._creation_ns) > _TWO_MIN_NS and low < self.upper_bound:
+                new_ub = low if low > lb else lb
+                if new_ub < self.upper_bound:
+                    self.upper_bound = float(new_ub)
+                self.touch_history.append((timestamp, self.touches, lb, self.upper_bound))
 
     def _is_body_break(self, close: float) -> bool:
         return (self.pool_type == 'BSL' and close > self.upper_bound) or \
@@ -131,7 +202,8 @@ class GapEngine:
                 )
                 self.active_gaps.append(new_gap)
 
-        self._check_fills(high, low)
+        if self.active_gaps:
+            self._check_fills(high, low)
 
         self._last_candle_time = timestamp
         self._last_close_price = close_price
@@ -182,80 +254,109 @@ class LiquidityEngine:
     def __init__(self, tolerance_ticks: int = 4, bucket_size: float = 100.0):
         self.tolerance = TickTolerance(ticks=tolerance_ticks)
         self.bucket_size = bucket_size
+        self._step = int(bucket_size)
         self.vault: Dict[int, List[LiquidityPool]] = {}
         self.archived_pools: List[LiquidityPool] = []
 
     def _get_bucket_key(self, price: float) -> int:
-        return int(price // self.bucket_size) * int(self.bucket_size)
+        return int(price // self.bucket_size) * self._step
 
-    def add_new_swing(self, pool_type: str, price: float, timestamp: pd.Timestamp):
-        bucket_key = self._get_bucket_key(price)
-        step = int(self.bucket_size)
-        buckets_to_check = [bucket_key - step, bucket_key, bucket_key + step]
+    def add_new_swing(
+        self,
+        pool_type: str,
+        price: float,
+        timestamp: pd.Timestamp,
+        ts_ns: Optional[int] = None,
+    ):
+        if ts_ns is None:
+            ts_ns = _ts_to_ns(timestamp)
+        bucket_key = int(price // self.bucket_size) * self._step
+        step = self._step
+        max_dist = self.tolerance.max_distance
+        vault = self.vault
 
-        for b_key in buckets_to_check:
-            if b_key not in self.vault:
+        for b_key in (bucket_key - step, bucket_key, bucket_key + step):
+            bucket = vault.get(b_key)
+            if bucket is None:
                 continue
-            for pool in self.vault[b_key]:
-                # Skip already-swept pools so subsequent swings can form their own pools
-                if not pool.is_active or pool.has_been_swept or pool.pool_type != pool_type:
-                    continue
-
-                if pool_type == 'BSL':
-                    if pool.upper_bound < price <= pool.upper_bound + self.tolerance.max_distance:
+            if pool_type == 'BSL':
+                for pool in bucket:
+                    if pool._broken or pool._swept or pool.pool_type != 'BSL':
+                        continue
+                    ub = pool.upper_bound
+                    if ub < price <= ub + max_dist:
                         pool.touches = 2
                         pool.upper_bound = float(price)
                         pool.last_touch_time = timestamp
+                        pool._last_touch_ns = ts_ns
                         pool.touch_history.append((timestamp, pool.touches, pool.lower_bound, pool.upper_bound))
                         return
-                    elif pool.lower_bound <= price <= pool.upper_bound:
-                        if (timestamp - pool.last_touch_time).total_seconds() >= 120:
+                    elif pool.lower_bound <= price <= ub:
+                        if (ts_ns - pool._last_touch_ns) >= _TWO_MIN_NS:
                             pool.touches += 1
-                            pool.lower_bound = float(min(pool.upper_bound, max(pool.lower_bound, price)))
+                            new_lb = price if price > pool.lower_bound else pool.lower_bound
+                            pool.lower_bound = float(ub if ub < new_lb else new_lb)
                             pool.last_touch_time = timestamp
-                            pool.touch_history.append((timestamp, pool.touches, pool.lower_bound, pool.upper_bound))
+                            pool._last_touch_ns = ts_ns
+                            pool.touch_history.append((timestamp, pool.touches, pool.lower_bound, ub))
                         return
-
-                elif pool_type == 'SSL':
-                    if pool.lower_bound - self.tolerance.max_distance <= price < pool.lower_bound:
+            else:
+                for pool in bucket:
+                    if pool._broken or pool._swept or pool.pool_type != 'SSL':
+                        continue
+                    lb = pool.lower_bound
+                    if lb - max_dist <= price < lb:
                         pool.touches = 2
                         pool.lower_bound = float(price)
                         pool.last_touch_time = timestamp
+                        pool._last_touch_ns = ts_ns
                         pool.touch_history.append((timestamp, pool.touches, pool.lower_bound, pool.upper_bound))
                         return
-                    elif pool.lower_bound <= price <= pool.upper_bound:
-                        if (timestamp - pool.last_touch_time).total_seconds() >= 120:
+                    elif lb <= price <= pool.upper_bound:
+                        if (ts_ns - pool._last_touch_ns) >= _TWO_MIN_NS:
                             pool.touches += 1
-                            pool.upper_bound = float(max(pool.lower_bound, min(pool.upper_bound, price)))
+                            new_ub = price if price < pool.upper_bound else pool.upper_bound
+                            pool.upper_bound = float(lb if lb > new_ub else new_ub)
                             pool.last_touch_time = timestamp
-                            pool.touch_history.append((timestamp, pool.touches, pool.lower_bound, pool.upper_bound))
+                            pool._last_touch_ns = ts_ns
+                            pool.touch_history.append((timestamp, pool.touches, lb, pool.upper_bound))
                         return
 
         new_pool = LiquidityPool(
             pool_type=pool_type,
-            upper_bound=float(price) if pool_type == 'BSL' else float(price + self.tolerance.max_distance),
-            lower_bound=float(price - self.tolerance.max_distance) if pool_type == 'BSL' else float(price),
+            upper_bound=float(price) if pool_type == 'BSL' else float(price + max_dist),
+            lower_bound=float(price - max_dist) if pool_type == 'BSL' else float(price),
             creation_time=timestamp,
             session_origin=SessionManager.get_session(timestamp)
         )
-        if bucket_key not in self.vault:
-            self.vault[bucket_key] = []
-        self.vault[bucket_key].append(new_pool)
+        bucket = vault.get(bucket_key)
+        if bucket is None:
+            vault[bucket_key] = [new_pool]
+        else:
+            bucket.append(new_pool)
 
     def clean_duplicate_pools(self):
         all_pools = self.get_all_pools()
-        global_macros = [p for p in all_pools if getattr(p, 'source', '') == "Macro_Session"]
+        global_macros = [p for p in all_pools if p.source == "Macro_Session"]
 
         if not global_macros:
             return
 
+        macro_sigs = [
+            (mp.pool_type, mp._creation_ns, mp.upper_bound if mp.pool_type == 'BSL' else mp.lower_bound)
+            for mp in global_macros
+        ]
+
         def _is_duplicate(p: LiquidityPool) -> bool:
-            if getattr(p, 'source', '') == "Macro_Session":
+            if p.source == "Macro_Session":
                 return False
-            for mp in global_macros:
-                if p.pool_type == mp.pool_type and abs((p.creation_time - mp.creation_time).total_seconds()) <= 43200:
-                    mp_price = mp.upper_bound if mp.pool_type == 'BSL' else mp.lower_bound
-                    if abs(p.initial_price - mp_price) <= 1.0:
+            p_type = p.pool_type
+            p_ns = p._creation_ns
+            p_init = p.initial_price
+            for mp_type, mp_ns, mp_price in macro_sigs:
+                if p_type == mp_type:
+                    diff = p_ns - mp_ns if p_ns >= mp_ns else mp_ns - p_ns
+                    if diff <= _TWELVE_HR_NS and abs(p_init - mp_price) <= 1.0:
                         return True
             return False
 
@@ -269,44 +370,91 @@ class LiquidityEngine:
         self.archived_pools = [p for p in self.archived_pools if not _is_duplicate(p)]
 
     def inject_macro_session_pool(self, pool_type: str, price: float, timestamp: pd.Timestamp, session_name: str):
-        bucket_key = self._get_bucket_key(price)
+        bucket_key = int(price // self.bucket_size) * self._step
+        max_dist = self.tolerance.max_distance
 
         new_pool = LiquidityPool(
             pool_type=pool_type,
-            upper_bound=float(price) if pool_type == 'BSL' else float(price + self.tolerance.max_distance),
-            lower_bound=float(price - self.tolerance.max_distance) if pool_type == 'BSL' else float(price),
+            upper_bound=float(price) if pool_type == 'BSL' else float(price + max_dist),
+            lower_bound=float(price - max_dist) if pool_type == 'BSL' else float(price),
             creation_time=timestamp,
             session_origin=session_name,
             source="Macro_Session",
             touches=1
         )
 
-        if bucket_key not in self.vault:
-            self.vault[bucket_key] = []
-        self.vault[bucket_key].append(new_pool)
+        bucket = self.vault.get(bucket_key)
+        if bucket is None:
+            self.vault[bucket_key] = [new_pool]
+        else:
+            bucket.append(new_pool)
 
-    def check_for_sweeps_and_breaks(self, high: float, low: float, close: float, timestamp: pd.Timestamp):
-        start_bucket = self._get_bucket_key(low)
-        end_bucket = self._get_bucket_key(high)
-        step = int(self.bucket_size)
-        keys_to_check = range(start_bucket, end_bucket + step, step)
+    def check_for_sweeps_and_breaks(
+        self,
+        high: float,
+        low: float,
+        close: float,
+        timestamp: pd.Timestamp,
+        ts_ns: Optional[int] = None,
+    ):
+        vault = self.vault
+        if not vault:
+            return
 
-        for key in keys_to_check:
-            if key not in self.vault:
+        step = self._step
+        start_bucket = int(low // self.bucket_size) * step
+        end_bucket = int(high // self.bucket_size) * step
+
+        if start_bucket == end_bucket:
+            bucket = vault.get(start_bucket)
+            if bucket is None:
+                return
+            self._process_bucket(start_bucket, bucket, high, low, close, timestamp, ts_ns)
+            return
+
+        key = start_bucket
+        while key <= end_bucket:
+            bucket = vault.get(key)
+            if bucket is not None:
+                self._process_bucket(key, bucket, high, low, close, timestamp, ts_ns)
+            key += step
+
+    def _process_bucket(
+        self,
+        key: int,
+        bucket: List[LiquidityPool],
+        high: float,
+        low: float,
+        close: float,
+        timestamp: pd.Timestamp,
+        ts_ns: Optional[int],
+    ) -> None:
+        any_broken = False
+        for pool in bucket:
+            if pool._broken:
+                any_broken = True
                 continue
+            if pool.pool_type == 'BSL':
+                if close <= pool.upper_bound and high <= pool.upper_bound and high <= pool.lower_bound:
+                    continue
+            else:
+                if close >= pool.lower_bound and low >= pool.lower_bound and low >= pool.upper_bound:
+                    continue
 
+            if ts_ns is None:
+                ts_ns = _ts_to_ns(timestamp)
+            pool._evaluate_candle_fast(high, low, close, timestamp, ts_ns)
+            if pool._broken:
+                any_broken = True
+
+        if any_broken:
             active_in_bucket: List[LiquidityPool] = []
-            for pool in self.vault[key]:
-                if pool.is_active:
-                    pool.evaluate_candle(high, low, close, timestamp)
-
-                # Keep only unbroken pools in the active spatial bucket;
-                # prune broken pools into archived_pools immediately.
-                if pool.is_active:
-                    active_in_bucket.append(pool)
+            archived = self.archived_pools
+            for pool in bucket:
+                if pool._broken:
+                    archived.append(pool)
                 else:
-                    self.archived_pools.append(pool)
-
+                    active_in_bucket.append(pool)
             if active_in_bucket:
                 self.vault[key] = active_in_bucket
             else:
@@ -329,10 +477,20 @@ def track_liquidity(
 ) -> tuple[pd.DataFrame, LiquidityEngine]:
     df = df_structure.copy()
     times = df.index
+    n = len(df)
     engine = LiquidityEngine(tolerance_ticks=tolerance_ticks)
+    if n == 0:
+        return df, engine
+
+    times_ns = _index_to_ns(times).tolist()
+    times_list = times.tolist()
 
     # Sort swings chronologically
     sorted_swings = sorted(swings, key=lambda x: x["time"])
+    swing_ns = [_ts_to_ns(s["time"]) for s in sorted_swings]
+    swing_is_high = [s["type"] == "SwingHigh" for s in sorted_swings]
+    swing_is_low = [s["type"] == "SwingLow" for s in sorted_swings]
+    swing_prices = [float(s["price"]) for s in sorted_swings]
     swing_idx = 0
     num_swings = len(sorted_swings)
 
@@ -342,29 +500,34 @@ def track_liquidity(
     for ts in sorted(macro_pools_by_time.keys()):
         for m_pool in macro_pools_by_time[ts]:
             flat_macros.append(m_pool)
+    macro_ns = [_ts_to_ns(m["time"]) for m in flat_macros]
     macro_idx = 0
     num_macros = len(flat_macros)
 
-    highs = df["high"].values
-    lows = df["low"].values
-    closes = df["close"].values
+    highs = df["high"].to_numpy(dtype=float, copy=False).tolist()
+    lows = df["low"].to_numpy(dtype=float, copy=False).tolist()
+    closes = df["close"].to_numpy(dtype=float, copy=False).tolist()
 
-    for i in range(len(df)):
-        current_time = times[i]
+    add_swing = engine.add_new_swing
+    inject_macro = engine.inject_macro_session_pool
+    check_sweeps = engine.check_for_sweeps_and_breaks
+
+    for i in range(n):
+        c_ns = times_ns[i]
+        current_time = times_list[i]
 
         # 1. Inject any swings that occurred up to `current_time`
-        while swing_idx < num_swings and sorted_swings[swing_idx]["time"] <= current_time:
-            swing = sorted_swings[swing_idx]
-            if swing["type"] == "SwingHigh":
-                engine.add_new_swing("BSL", swing["price"], current_time)
-            elif swing["type"] == "SwingLow":
-                engine.add_new_swing("SSL", swing["price"], current_time)
+        while swing_idx < num_swings and swing_ns[swing_idx] <= c_ns:
+            if swing_is_high[swing_idx]:
+                add_swing("BSL", swing_prices[swing_idx], current_time, ts_ns=c_ns)
+            elif swing_is_low[swing_idx]:
+                add_swing("SSL", swing_prices[swing_idx], current_time, ts_ns=c_ns)
             swing_idx += 1
 
         # 2. Inject any Macro Session pools that occurred up to `current_time`
-        while macro_idx < num_macros and flat_macros[macro_idx]["time"] <= current_time:
+        while macro_idx < num_macros and macro_ns[macro_idx] <= c_ns:
             m_pool = flat_macros[macro_idx]
-            engine.inject_macro_session_pool(
+            inject_macro(
                 pool_type=m_pool["type"],
                 price=m_pool["price"],
                 timestamp=current_time,
@@ -374,7 +537,7 @@ def track_liquidity(
 
         # 3. Evaluate sweeps and breaks on the current candle
         if i >= 1:
-            engine.check_for_sweeps_and_breaks(highs[i], lows[i], closes[i], current_time)
+            check_sweeps(highs[i], lows[i], closes[i], current_time, ts_ns=c_ns)
 
     engine.clean_duplicate_pools()
 

@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
-from typing import List, Tuple
+import heapq
+from typing import List, Optional, Tuple
+import numpy as np
 import pandas as pd
 
 
@@ -25,7 +27,7 @@ class FairValueGap:
     @property
     def is_active(self) -> bool:
         # Include "Filled" so the gap stays alive to listen for an "Inverted" breakout
-        return self.status in ["Active", "Partially_Mitigated", "Filled"]
+        return self.status in ("Active", "Partially_Mitigated", "Filled")
 
     def evaluate_candle(self, high: float, low: float, close: float, timestamp: pd.Timestamp) -> None:
         if not self.is_active or timestamp <= self.creation_time:
@@ -90,37 +92,53 @@ class FairValueGap:
                     self.events.append(("FILLED_BY_WICK", timestamp, high))
 
 
+def _detect_fvgs_indexed(df: pd.DataFrame) -> Tuple[List[FairValueGap], List[int]]:
+    n = len(df)
+    if n < 3:
+        return [], []
+
+    highs = df['high'].to_numpy(dtype=float)
+    lows = df['low'].to_numpy(dtype=float)
+    times = df.index
+
+    c1_high = highs[:-2]
+    c1_low = lows[:-2]
+    c3_high = highs[2:]
+    c3_low = lows[2:]
+
+    bisi_mask = c3_low > c1_high
+    sibi_mask = (~bisi_mask) & (c1_low > c3_high)
+    any_indices = np.flatnonzero(bisi_mask | sibi_mask)
+
+    fvgs: List[FairValueGap] = []
+    bar_indices: List[int] = []
+
+    for k in any_indices.tolist():
+        bar_i = k + 2
+        if bisi_mask[k]:
+            fvgs.append(FairValueGap(
+                fvg_type='BISI',
+                top=float(c3_low[k]),
+                bottom=float(c1_high[k]),
+                creation_time=times[bar_i],
+            ))
+        else:
+            fvgs.append(FairValueGap(
+                fvg_type='SIBI',
+                top=float(c1_low[k]),
+                bottom=float(c3_high[k]),
+                creation_time=times[bar_i],
+            ))
+        bar_indices.append(bar_i)
+
+    return fvgs, bar_indices
+
+
 def detect_fvgs(df: pd.DataFrame) -> List[FairValueGap]:
     """
     Scans historical data and detects all classic 3-candle FVG patterns.
     """
-    fvgs = []
-    highs = df['high'].values
-    lows = df['low'].values
-    times = df.index
-
-    for i in range(2, len(df)):
-        c1_high, c1_low = highs[i - 2], lows[i - 2]
-        c3_high, c3_low = highs[i], lows[i]
-
-        # Bullish FVG (BISI): 3rd candle Low is higher than 1st candle High
-        if c3_low > c1_high:
-            fvgs.append(FairValueGap(
-                fvg_type='BISI',
-                top=float(c3_low),
-                bottom=float(c1_high),
-                creation_time=times[i]
-            ))
-
-        # Bearish FVG (SIBI): 3rd candle High is lower than 1st candle Low
-        elif c1_low > c3_high:
-            fvgs.append(FairValueGap(
-                fvg_type='SIBI',
-                top=float(c1_low),
-                bottom=float(c3_high),
-                creation_time=times[i]
-            ))
-
+    fvgs, _ = _detect_fvgs_indexed(df)
     return fvgs
 
 
@@ -129,26 +147,111 @@ def track_fvgs(df: pd.DataFrame) -> List[FairValueGap]:
     Detects FVGs and runs them through chronological price action
     to track their lifecycle (Mitigated, Filled, Inverted) without lookahead bias.
     """
-    fvgs = detect_fvgs(df)
-    active_fvgs = []
-    fvg_idx = 0
+    fvgs, bar_indices = _detect_fvgs_indexed(df)
+    n = len(df)
+    if not fvgs or n == 0:
+        return fvgs
 
-    highs = df['high'].values
-    lows = df['low'].values
-    closes = df['close'].values
+    highs = df['high'].to_numpy(dtype=float).tolist()
+    lows = df['low'].to_numpy(dtype=float).tolist()
+    closes = df['close'].to_numpy(dtype=float).tolist()
     times = df.index
 
-    for i in range(len(df)):
-        current_time = times[i]
+    bisi_unfilled: List[Tuple[float, int, FairValueGap]] = []
+    bisi_filled: List[Tuple[float, int, FairValueGap]] = []
+    sibi_unfilled: List[Tuple[float, int, FairValueGap]] = []
+    sibi_filled: List[Tuple[float, int, FairValueGap]] = []
 
-        # Introduce newly formed FVGs at their precise creation time
-        while fvg_idx < len(fvgs) and fvgs[fvg_idx].creation_time == current_time:
-            active_fvgs.append(fvgs[fvg_idx])
-            fvg_idx += 1
+    heappush = heapq.heappush
+    heappop = heapq.heappop
 
-        # Evaluate active FVGs against the current candle
-        for fvg in active_fvgs:
-            if fvg.is_active:
-                fvg.evaluate_candle(highs[i], lows[i], closes[i], current_time)
+    num_fvgs = len(fvgs)
+    fvg_idx = 0
+    next_fvg_bar = bar_indices[0]
+
+    for i in range(n):
+        h = highs[i]
+        l = lows[i]
+        c = closes[i]
+        min_lc = l if l < c else c
+        max_hc = h if h > c else c
+
+        current_time: Optional[pd.Timestamp] = None
+
+        # 1. Filled BISI: only transitions to Inverted when close < bottom
+        if bisi_filled and -bisi_filled[0][0] > c:
+            current_time = times[i]
+            repush_bf = []
+            while bisi_filled and -bisi_filled[0][0] > c:
+                entry = heappop(bisi_filled)
+                fvg = entry[2]
+                fvg.evaluate_candle(h, l, c, current_time)
+                if fvg.status != "Inverted":
+                    repush_bf.append(entry)
+            for entry in repush_bf:
+                heappush(bisi_filled, entry)
+
+        # 2. Unfilled BISI: can only transition when min(low, close) <= top
+        if bisi_unfilled and -bisi_unfilled[0][0] >= min_lc:
+            if current_time is None:
+                current_time = times[i]
+            repush_bu = []
+            while bisi_unfilled and -bisi_unfilled[0][0] >= min_lc:
+                entry = heappop(bisi_unfilled)
+                fvg = entry[2]
+                fvg.evaluate_candle(h, l, c, current_time)
+                st = fvg.status
+                if st == "Inverted":
+                    continue
+                elif st == "Filled":
+                    heappush(bisi_filled, (-fvg.bottom, entry[1], fvg))
+                else:
+                    repush_bu.append(entry)
+            for entry in repush_bu:
+                heappush(bisi_unfilled, entry)
+
+        # 3. Filled SIBI: only transitions to Inverted when close > top
+        if sibi_filled and sibi_filled[0][0] < c:
+            if current_time is None:
+                current_time = times[i]
+            repush_sf = []
+            while sibi_filled and sibi_filled[0][0] < c:
+                entry = heappop(sibi_filled)
+                fvg = entry[2]
+                fvg.evaluate_candle(h, l, c, current_time)
+                if fvg.status != "Inverted":
+                    repush_sf.append(entry)
+            for entry in repush_sf:
+                heappush(sibi_filled, entry)
+
+        # 4. Unfilled SIBI: can only transition when max(high, close) >= bottom
+        if sibi_unfilled and sibi_unfilled[0][0] <= max_hc:
+            if current_time is None:
+                current_time = times[i]
+            repush_su = []
+            while sibi_unfilled and sibi_unfilled[0][0] <= max_hc:
+                entry = heappop(sibi_unfilled)
+                fvg = entry[2]
+                fvg.evaluate_candle(h, l, c, current_time)
+                st = fvg.status
+                if st == "Inverted":
+                    continue
+                elif st == "Filled":
+                    heappush(sibi_filled, (fvg.top, entry[1], fvg))
+                else:
+                    repush_su.append(entry)
+            for entry in repush_su:
+                heappush(sibi_unfilled, entry)
+
+        # 5. Introduce newly formed FVGs at bar i (evaluate_candle skips timestamp <= creation_time)
+        if i == next_fvg_bar:
+            while fvg_idx < num_fvgs and bar_indices[fvg_idx] == i:
+                new_fvg = fvgs[fvg_idx]
+                if new_fvg.fvg_type == 'BISI':
+                    heappush(bisi_unfilled, (-new_fvg.top, fvg_idx, new_fvg))
+                else:
+                    heappush(sibi_unfilled, (new_fvg.bottom, fvg_idx, new_fvg))
+                fvg_idx += 1
+            next_fvg_bar = bar_indices[fvg_idx] if fvg_idx < num_fvgs else -1
 
     return fvgs

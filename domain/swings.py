@@ -1,60 +1,53 @@
+import numpy as np
 import pandas as pd
 
 
-def detect_swings(df):
+def detect_swings(df: pd.DataFrame):
     """
     Scans the dataframe for strict 2-candle structural swings.
     Swing Low = 1 Bearish Close -> 1 Bullish Close (minimum wick of the two).
     Swing High = 1 Bullish Close -> 1 Bearish Close (maximum wick of the two).
     Handles dojis by evaluating their close relative to the previous candle's close.
     """
-    swings = []
+    n = len(df)
+    if n < 2:
+        return []
+
+    opens = df['open'].to_numpy(dtype=np.float64, copy=False)
+    highs = df['high'].to_numpy(copy=False)
+    lows = df['low'].to_numpy(copy=False)
+    closes = df['close'].to_numpy(dtype=np.float64, copy=False)
 
     # 1. Evaluate synthetic colors for the entire DataFrame upfront
-    prev_closes = df['close'].shift(1)
+    prev_closes = np.empty(n, dtype=np.float64)
+    prev_closes[0] = np.nan
+    prev_closes[1:] = closes[:-1]
 
-    is_green = df['close'] > df['open']
-    is_red = df['close'] < df['open']
-    is_doji = df['close'] == df['open']
+    is_green = closes > opens
+    is_red = closes < opens
+    is_doji = closes == opens
 
     # Resolve dojis: Bullish if closed >= prev close, Bearish if closed < prev close
-    bullish_mask = is_green | (is_doji & (df['close'] >= prev_closes))
-    bearish_mask = is_red | (is_doji & (df['close'] < prev_closes))
+    bullish_mask = is_green | (is_doji & (closes >= prev_closes))
+    bearish_mask = is_red | (is_doji & (closes < prev_closes))
 
-    # 2. Scan for 2-candle sequences
-    # Start at index 1 so we can always look back at exactly 1 previous candle
-    for i in range(1, len(df)):
+    # 2. Vectorized 2-candle transition masks (positions 0..n-2 correspond to bar indices 1..n-1)
+    sl_mask = bearish_mask[:-1] & bullish_mask[1:]
+    sh_mask = (~sl_mask) & bullish_mask[:-1] & bearish_mask[1:]
+    any_pos = np.flatnonzero(sl_mask | sh_mask)
 
-        # Wicks for extreme isolation
-        prev_low = df['low'].iloc[i - 1]
-        prev_high = df['high'].iloc[i - 1]
-        curr_low = df['low'].iloc[i]
-        curr_high = df['high'].iloc[i]
+    if len(any_pos) == 0:
+        return []
 
-        # Use our pre-calculated synthetic colors
-        prev_is_bearish = bearish_mask.iloc[i - 1]
-        prev_is_bullish = bullish_mask.iloc[i - 1]
-        curr_is_bearish = bearish_mask.iloc[i]
-        curr_is_bullish = bullish_mask.iloc[i]
+    bar_indices = any_pos + 1
+    swing_times = df.index[bar_indices].tolist()
+    min_lows = np.minimum(lows[any_pos], lows[bar_indices]).tolist()
+    max_highs = np.maximum(highs[any_pos], highs[bar_indices]).tolist()
+    is_sl = sl_mask[any_pos].tolist()
 
-        # LOGIC 1: Detect Swing Low (Red -> Green)
-        if prev_is_bearish and curr_is_bullish:
-            # Isolate the extreme low between ONLY these two candles
-            actual_low = min(prev_low, curr_low)
-            swings.append({
-                'type': 'SwingLow',
-                'price': actual_low,
-                'time': df.index[i]  # Anchors to the transition candle
-            })
-
-        # LOGIC 2: Detect Swing High (Green -> Red)
-        elif prev_is_bullish and curr_is_bearish:
-            # Isolate the extreme high between ONLY these two candles
-            actual_high = max(prev_high, curr_high)
-            swings.append({
-                'type': 'SwingHigh',
-                'price': actual_high,
-                'time': df.index[i]  # Anchors to the transition candle
-            })
-
-    return swings
+    return [
+        {'type': 'SwingLow', 'price': min_lows[k], 'time': swing_times[k]}
+        if is_sl[k]
+        else {'type': 'SwingHigh', 'price': max_highs[k], 'time': swing_times[k]}
+        for k in range(len(any_pos))
+    ]
