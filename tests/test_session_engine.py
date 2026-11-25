@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Kyrylo Homberh
+# SPDX-License-Identifier: AGPL-3.0-only
+
 import pandas as pd
 from engine.session_engine import extract_session_liquidity
 

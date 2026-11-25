@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Kyrylo Homberh
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from pathlib import Path
 from typing import Optional, Tuple, List
 import pandas as pd

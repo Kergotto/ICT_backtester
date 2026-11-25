@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Kyrylo Homberh
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from dataclasses import dataclass, field
 import heapq
 from typing import List, Optional, Tuple

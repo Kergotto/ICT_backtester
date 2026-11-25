@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Kyrylo Homberh
+# SPDX-License-Identifier: AGPL-3.0-only
+
 import numpy as np
 import pandas as pd
 from engine.event_bus import BacktestEngine
@@ -151,3 +154,117 @@ def test_option_a_last_fvg_of_range_inversion_triggers_ifvg_bos():
     assert ifvg_events[0]["direction"] == "BEARISH"
     assert int(df_struct["trend"].iloc[5]) != -1
     assert int(df_struct["trend"].iloc[7]) == -1
+
+def test_trailing_stop_toggle_and_pluggable_manager():
+    """
+    Verifies Layer 3 isolation:
+    - enable_trailing_sl=False or trailing_stop_manager=None keeps SL fixed.
+    - enable_trailing_sl=True uses ICTStructuralTrailingStop and trails SL.
+    - Custom BaseTrailingStopManager subclasses plug in cleanly.
+    """
+    from engine.event_bus import BarContext
+    from engine.portfolio import Portfolio
+    from engine.broker import SimulatedBroker
+    from strategies.trailing_stops import BaseTrailingStopManager, ICTStructuralTrailingStop
+
+    t0 = pd.Timestamp("2026-10-16 09:40:00", tz="America/New_York")
+    t1 = pd.Timestamp("2026-10-16 09:41:00", tz="America/New_York")
+    t2 = pd.Timestamp("2026-10-16 09:42:00", tz="America/New_York")
+    hist_df = pd.DataFrame(
+        {
+            "open":  [5000.0, 5002.0, 5006.0],
+            "high":  [5003.0, 5005.0, 5017.0],
+            "low":   [4999.0, 5001.0, 5005.0],
+            "close": [5002.0, 5004.0, 5015.0],
+            "volume": [100, 100, 100],
+        },
+        index=pd.DatetimeIndex([t0, t1, t2]),
+    )
+    ctx = BarContext(
+        symbol="ES",
+        timestamp=t2,
+        bar_index=2,
+        open=5006.0,
+        high=5017.0,
+        low=5005.0,
+        close=5015.0,
+        volume=100.0,
+        history_df=hist_df,
+        confirmed_swings=[{"type": "SwingLow", "time": t1, "price": 5001.0}],
+    )
+
+    def _run_with_strategy(strat):
+        pf = Portfolio(initial_capital=100_000.0)
+        br = SimulatedBroker(pf, commission_per_contract=0.0, slippage_ticks=0)
+        br.submit_order(
+            symbol="ES",
+            direction="LONG",
+            order_type="MARKET",
+            quantity=1,
+            stop_loss=4990.0,
+            take_profit=5020.0,
+            timestamp=t0,
+            current_close=5000.0,
+        )
+        strat.on_bar(ctx, br, pf)
+        return pf.positions["ES"]
+
+    # 1. Trailing OFF via boolean flag -> SL stays fixed at 4990.0
+    strat_off = ICTMultiTimeframeStrategy(enable_trailing_sl=False)
+    assert strat_off.trailing_stop_manager is None
+    assert _run_with_strategy(strat_off).stop_loss == 4990.0
+
+    # 2. Trailing OFF via explicit trailing_stop_manager=None -> SL stays fixed
+    strat_none = ICTMultiTimeframeStrategy(enable_trailing_sl=True, trailing_stop_manager=None)
+    assert strat_none.enable_trailing_sl is False
+    assert _run_with_strategy(strat_none).stop_loss == 4990.0
+
+    # 3. Trailing ON (default ICTStructuralTrailingStop) -> >=80% progress moves SL to BE swing low - 0.50
+    strat_on = ICTMultiTimeframeStrategy(enable_trailing_sl=True)
+    assert isinstance(strat_on.trailing_stop_manager, ICTStructuralTrailingStop)
+    assert _run_with_strategy(strat_on).stop_loss == 5000.5
+
+    # 4. Pluggable custom trailing manager
+    class CustomTrailManager(BaseTrailingStopManager):
+        def __init__(self):
+            self.calls = 0
+
+        def on_bar_manage(self, bar_ctx, position, broker, portfolio):
+            self.calls += 1
+            position.update_stop_loss(4995.0, bar_ctx.timestamp, "custom")
+
+    custom_mgr = CustomTrailManager()
+    strat_custom = ICTMultiTimeframeStrategy(enable_trailing_sl=True, trailing_stop_manager=custom_mgr)
+    pos_custom = _run_with_strategy(strat_custom)
+    assert custom_mgr.calls == 1
+    assert pos_custom.stop_loss == 4995.0
+
+
+def test_experience_config_pure_strategy_vs_full_toggles():
+    """
+    Verifies Layer 2 toggles between ExperienceConfig.full() and ExperienceConfig.pure_strategy().
+    """
+    from strategies.experience import ExperienceConfig, ICTExperienceLayer
+
+    full_layer = ICTExperienceLayer(ExperienceConfig.full())
+    pure_layer = ICTExperienceLayer(ExperienceConfig.pure_strategy())
+
+    # Grading gate
+    assert full_layer.passes_grade_filter("B", "A") is False
+    assert pure_layer.passes_grade_filter("B", "A") is True
+
+    # Cross-index exclusivity
+    d = pd.Timestamp("2026-10-06").date()
+    shared = {d: ("ES", pd.Timestamp("2026-10-06 09:40:00", tz="America/New_York"))}
+    assert full_layer.get_companion_trade_info(shared, d)[0] is not None
+    assert pure_layer.get_companion_trade_info(shared, d) == (None, None)
+
+    # ATH short block
+    assert full_layer.check_ath_short_block("SHORT", True) is not None
+    assert pure_layer.check_ath_short_block("SHORT", True) is None
+
+    # Symbol SL heuristics (NQ cap vs uncapped pure strategy)
+    full_sl = full_layer.get_stop_loss_parameters("NQ", "LONG", "5M_FVG_RETRACE", 3, 42.0, 0.5)
+    pure_sl = pure_layer.get_stop_loss_parameters("NQ", "LONG", "5M_FVG_RETRACE", 3, 42.0, 0.5)
+    assert full_sl["max_valid_sl"] == 102.0
+    assert pure_sl["max_valid_sl"] is None

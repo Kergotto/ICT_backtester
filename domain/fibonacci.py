@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Kyrylo Homberh
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 import pandas as pd

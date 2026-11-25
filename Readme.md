@@ -46,3 +46,21 @@ This project follows an 8-month academic development lifecycle aligned with bach
 #### Stage 5: Advanced Pattern Mining & Finalization (Months 7–8)
 - [ ] (Optional) Apply Association Rule Mining to extract multi-factor pattern combinations.
 - [ ] Finalize thesis documentation, performance reports, and defense presentation.
+
+## License
+
+Copyright (C) 2026 Kyrylo Homberh
+
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0-only)** — see the [LICENSE](LICENSE) file for the full terms.
+
+In plain English:
+- You are free to study, run, and modify this code for personal or open-source use.
+- If you distribute a modified version—or run it as part of a hosted web app or network service—you must keep this copyright notice and make your full modified source code available under the same AGPL-3.0 license.
+- For commercial licensing inquiries outside the terms of AGPL-3.0, feel free to reach out directly.
+
+### Contributions
+Bug reports, edge-case findings, and feature ideas via GitHub Issues are always welcome. At this stage, outside Pull Requests are not being merged into the main repository while the core architecture is actively developed.
+
+## Disclaimer
+
+This repository is an educational software engineering and historical market-research project. It is **not** financial advice and **not** an automated live trading bot. Historical backtest results do not guarantee future performance.

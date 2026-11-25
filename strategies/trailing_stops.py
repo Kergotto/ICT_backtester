@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Kyrylo Homberh
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from abc import ABC, abstractmethod
 from typing import Optional
 import pandas as pd

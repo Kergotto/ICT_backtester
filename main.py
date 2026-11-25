@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Kyrylo Homberh
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List, Any
 import numpy as np
@@ -6,14 +9,24 @@ import pandas as pd
 from core.data_loader import load_historical_data, load_databento_pair
 from engine.event_bus import BacktestEngine, BacktestResult
 from strategies.base import BuyAndHoldStrategy, RandomEntryStrategy
+from strategies.experience import ExperienceConfig
 from strategies.ict_multi_tf import ICTMultiTimeframeStrategy
 
 # ==============================================================================
-# 📅 BACKTEST DATE RANGE CONFIGURATION
+# 📅 BACKTEST DATE RANGE & ABLATION CONFIGURATION
 # ==============================================================================
 USE_DATABENTO_5Y: bool = True
 BACKTEST_START_DATE: Optional[str] = "2026-09-29"
 BACKTEST_END_DATE: Optional[str] = "2026-10-27 17:00:00"
+
+# Toggle side-by-side 3-layer ablation variants in the summary table:
+#   1. Layer 1 Only:   Pure Strategy + Fixed SL (Experience OFF, Partials OFF, Trailing OFF)
+#   2. Layer 1 + 2:    Strategy + Experience + Fixed SL (Experience ON, Partials ON, Trailing OFF)
+#   3. Layer 1 + 2 + 3: Full System (Golden Baseline: Experience ON, Partials ON, Trailing ON)
+RUN_ABLATION_COMPARISON: bool = True
+
+# Audit log filter mode: "FOCUS" (9 focus dates), "NON_FOCUS" (Phase 2 false-positive review), or "ALL"
+AUDIT_MODE: str = "NON_FOCUS"
 
 # Focus dates from your manual TradingView journal
 FOCUS_AUDIT_DATES: Optional[List[str]] = [
@@ -75,13 +88,23 @@ def _print_tradingview_audit_log(
     result: BacktestResult,
     strategy_obj: ICTMultiTimeframeStrategy,
     focus_dates: Optional[List[str]] = None,
+    audit_mode: str = "FOCUS",
 ) -> None:
     trades_by_date: Dict[str, List[Any]] = {}
     for t in result.trades:
         d_str = t.entry_time.strftime("%Y-%m-%d")
         trades_by_date.setdefault(d_str, []).append(t)
 
-    if focus_dates:
+    mode = audit_mode.upper().strip()
+    if mode == "NON_FOCUS" and focus_dates:
+        focus_set = set(focus_dates)
+        dates_to_show = [d for d in sorted(trades_by_date.keys()) if d not in focus_set]
+        non_focus_count = sum(len(trades_by_date[d]) for d in dates_to_show)
+        header_sub = (
+            f"Total Trades in Sample: {len(result.trades)} | "
+            f"Non-Focus Trades Shown ({len(dates_to_show)} dates): {non_focus_count}"
+        )
+    elif mode == "FOCUS" and focus_dates:
         dates_to_show = focus_dates
         focus_trade_count = sum(len(trades_by_date.get(d, [])) for d in focus_dates)
         header_sub = (
@@ -241,6 +264,7 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
         f"   NQ Range: {df_nq_1m.index[0]} -> {df_nq_1m.index[-1]} ({len(df_nq_1m)} bars)"
     )
 
+    shared_dates_exp_fixed: Dict[Any, Any] = {}
     shared_dates_grade_b: Dict[Any, Any] = {}
     shared_dates_grade_a: Dict[Any, Any] = {}
 
@@ -269,6 +293,53 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
             ),
             precompute_domain=False,
         )
+        sym_results: List[BacktestResult] = [res_bh, res_rand]
+
+        if RUN_ABLATION_COMPARISON:
+            # Layer 1 Only: Pure Mechanical Entry Model + Fixed Set-and-Forget SL
+            ict_pure = ICTMultiTimeframeStrategy(
+                stop_loss_points=default_sl,
+                reward_risk_ratio=2.0,
+                min_rr=1.65,
+                min_tp1_rr=0.80,
+                max_rr=3.85,
+                partial_cut_pct=0.30,
+                enable_partials=False,
+                enable_trailing_sl=False,
+                risk_per_trade_pct=0.01,
+                use_dynamic_sizing=True,
+                sl_mode="tight_1m",
+                min_grade="B",
+                require_killzone=True,
+                max_trades_per_day=1,
+                experience_config=ExperienceConfig.pure_strategy(),
+            )
+            ict_pure.name = "ICT_PureStrategy (Fixed SL)"
+            res_pure = engine.run(df_prim, strategy=ict_pure, df_secondary=df_sec, precompute_domain=True)
+
+            # Layer 1 + Layer 2: Strategy + Full Experience + Partials + Fixed SL (Trailing OFF)
+            ict_exp_fixed = ICTMultiTimeframeStrategy(
+                stop_loss_points=default_sl,
+                reward_risk_ratio=2.0,
+                min_rr=1.65,
+                min_tp1_rr=0.80,
+                max_rr=3.85,
+                partial_cut_pct=0.30,
+                enable_partials=True,
+                enable_trailing_sl=False,
+                risk_per_trade_pct=0.01,
+                use_dynamic_sizing=True,
+                sl_mode="tight_1m",
+                min_grade="A",
+                require_killzone=True,
+                max_trades_per_day=1,
+                shared_daily_trade_dates=shared_dates_exp_fixed,
+                experience_config=ExperienceConfig.full(),
+            )
+            ict_exp_fixed.name = "ICT_Strategy+Exp (Fixed SL)"
+            res_exp_fixed = engine.run(df_prim, strategy=ict_exp_fixed, df_secondary=df_sec, precompute_domain=True)
+
+            sym_results.extend([res_pure, res_exp_fixed])
 
         ict_all_grades = ICTMultiTimeframeStrategy(
             stop_loss_points=default_sl,
@@ -286,6 +357,7 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
             require_killzone=True,
             max_trades_per_day=1,
             shared_daily_trade_dates=shared_dates_grade_b,
+            experience_config=ExperienceConfig.full(),
         )
         ict_all_grades.name = "ICT_Strategy (Allow Grade B)"
         res_b = engine.run(df_prim, strategy=ict_all_grades, df_secondary=df_sec, precompute_domain=True)
@@ -306,12 +378,16 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
             require_killzone=True,
             max_trades_per_day=1,
             shared_daily_trade_dates=shared_dates_grade_a,
+            experience_config=ExperienceConfig.full(),
         )
         ict_a_only.name = "ICT_Strategy (Grade A/A+ Only)"
         res_a = engine.run(df_prim, strategy=ict_a_only, df_secondary=df_sec, precompute_domain=True)
 
-        _print_tradingview_audit_log(res_a, ict_a_only, focus_dates=FOCUS_AUDIT_DATES)
-        all_results.extend([res_bh, res_rand, res_b, res_a])
+        _print_tradingview_audit_log(
+            res_a, ict_a_only, focus_dates=FOCUS_AUDIT_DATES, audit_mode=AUDIT_MODE
+        )
+        sym_results.extend([res_b, res_a])
+        all_results.extend(sym_results)
 
     print("=" * 114)
     print(

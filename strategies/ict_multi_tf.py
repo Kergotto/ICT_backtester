@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Kyrylo Homberh
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from datetime import time
 from typing import Dict, List, Optional, Tuple, Any
 import pandas as pd

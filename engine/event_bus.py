@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Kyrylo Homberh
+# SPDX-License-Identifier: AGPL-3.0-only
+
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from datetime import time as dtime
