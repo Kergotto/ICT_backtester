@@ -212,6 +212,118 @@ class ICTExperienceLayer:
         if self.config.enable_cross_index_exclusivity and shared_daily_trade_dates is not None:
             shared_daily_trade_dates[trade_date] = (symbol, timestamp)
 
+    @staticmethod
+    def compute_leader_score(
+            trade: Any,
+            df_1m: pd.DataFrame,
+            er_bars: int = 15,
+            range_bars: int = 20,
+    ) -> Tuple[float, str]:
+        """
+        Scores whether an index is actively pushing in the trade direction (Leader)
+        versus chopping sideways (Consolidator), strictly using bars up to entry_time.
+        """
+        entry_ts = trade.entry_time
+        hist = df_1m.loc[:entry_ts]
+        if len(hist) < 3:
+            return 0.0, "insufficient_bars"
+
+        sign = 1.0 if trade.direction == "LONG" else -1.0
+
+        # 1. Signed Kaufman Efficiency Ratio (directional push vs. chop)
+        er_slice = hist["close"].iloc[-(er_bars + 1):].to_numpy(dtype=float)
+        if len(er_slice) >= 2:
+            net_move = (er_slice[-1] - er_slice[0]) * sign
+            path_len = float(abs(er_slice[1:] - er_slice[:-1]).sum())
+            dir_er = (net_move / path_len) if path_len > 1e-9 else 0.0
+        else:
+            dir_er = 0.0
+
+        # 2. Directional progress inside recent 20-bar range [0.0 .. 1.0]
+        rng_slice = hist.iloc[-range_bars:]
+        r_high = float(rng_slice["high"].max())
+        r_low = float(rng_slice["low"].min())
+        c_now = float(rng_slice["close"].iloc[-1])
+        span = r_high - r_low
+        if span > 1e-9:
+            range_pos = ((c_now - r_low) / span) if trade.direction == "LONG" else ((r_high - c_now) / span)
+        else:
+            range_pos = 0.5
+
+        # 3. Active intraday SMT displacement confirmer (which index actually broke 1m MSS)
+        meta = trade.metadata or {}
+        sym = trade.symbol.upper()
+        dir_prefix = "Bullish SMT" if trade.direction == "LONG" else "Bearish SMT"
+        conf_markers = (f"--> 1m MSS on {sym} ", f"--> 1m IFVG_MSS on {sym} ")
+        is_smt_confirmer = any(
+            (dir_prefix in line) and any(m in line for m in conf_markers)
+            for line in meta.get("smt_detail", [])
+        )
+        smt_bonus = 0.25 if is_smt_confirmer else 0.0
+
+        # Tiny tie-breaker from setup score (0..10)
+        setup_score_bonus = 0.01 * float(meta.get("score", 0))
+
+        total = (0.50 * dir_er) + (0.35 * range_pos) + smt_bonus + setup_score_bonus
+        detail = f"leader={total:.2f} (dir_ER={dir_er:+.2f}, rng_pos={range_pos:.2f}, smt_confirmer={is_smt_confirmer})"
+        return total, detail
+
+    @classmethod
+    def resolve_cross_index_winners(
+            cls,
+            res_es: Any,
+            res_nq: Any,
+            df_es_1m: pd.DataFrame,
+            df_nq_1m: pd.DataFrame,
+            tie_window_minutes: int = 0,
+    ) -> Tuple[Dict[Any, Any], Dict[Any, Any]]:
+        """
+        Resolves daily cross-index exclusivity with zero lookahead bias:
+        - Strictly earlier valid entry wins in real time (`tie_window_minutes=0`).
+        - When both indices fire on the exact same 1-minute bar, the actively
+          pushing Leader index beats the Consolidator index.
+        """
+        es_by_date = {t.entry_time.date(): t for t in res_es.trades}
+        nq_by_date = {t.entry_time.date(): t for t in res_nq.trades}
+
+        blocked_for_es: Dict[Any, Any] = {}
+        blocked_for_nq: Dict[Any, Any] = {}
+
+        for d in sorted(set(es_by_date.keys()) | set(nq_by_date.keys())):
+            t_es = es_by_date.get(d)
+            t_nq = nq_by_date.get(d)
+
+            if t_es is not None and t_nq is None:
+                blocked_for_nq[d] = ("ES", t_es.entry_time)
+                continue
+            if t_nq is not None and t_es is None:
+                blocked_for_es[d] = ("NQ", t_nq.entry_time)
+                continue
+
+            delta_min = (t_nq.entry_time - t_es.entry_time).total_seconds() / 60.0
+            es_score, es_det = cls.compute_leader_score(t_es, df_es_1m)
+            nq_score, nq_det = cls.compute_leader_score(t_nq, df_nq_1m)
+
+            if abs(delta_min) > tie_window_minutes:
+                winner = "ES" if t_es.entry_time < t_nq.entry_time else "NQ"
+                reason = f"earlier ({abs(delta_min):.0f}m lead)"
+            else:
+                winner = "NQ" if nq_score > es_score else "ES"
+                reason = "same-bar leader_score"
+
+            print(
+                f"   ⚖️  [Cross-Index {d}] ES {t_es.direction}@{t_es.entry_time.strftime('%H:%M')} [{es_det}] "
+                f"vs NQ {t_nq.direction}@{t_nq.entry_time.strftime('%H:%M')} [{nq_det}] "
+                f"--> WINNER: {winner} ({reason})"
+            )
+
+            if winner == "ES":
+                blocked_for_nq[d] = ("ES", t_es.entry_time)
+            else:
+                blocked_for_es[d] = ("NQ", t_nq.entry_time)
+
+        return blocked_for_es, blocked_for_nq
+
     # ------------------------------------------------------------------
     # 2. Market Regime Overrides (ATH Regime)
     # ------------------------------------------------------------------

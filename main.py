@@ -9,7 +9,7 @@ import pandas as pd
 from core.data_loader import load_historical_data, load_databento_pair
 from engine.event_bus import BacktestEngine, BacktestResult
 from strategies.base import BuyAndHoldStrategy, RandomEntryStrategy
-from strategies.experience import ExperienceConfig
+from strategies.experience import ExperienceConfig, ICTExperienceLayer
 from strategies.ict_multi_tf import ICTMultiTimeframeStrategy
 
 # ==============================================================================
@@ -89,6 +89,7 @@ def _print_tradingview_audit_log(
     strategy_obj: ICTMultiTimeframeStrategy,
     focus_dates: Optional[List[str]] = None,
     audit_mode: str = "FOCUS",
+    extra_dates: Optional[List[str]] = None,
 ) -> None:
     trades_by_date: Dict[str, List[Any]] = {}
     for t in result.trades:
@@ -98,11 +99,12 @@ def _print_tradingview_audit_log(
     mode = audit_mode.upper().strip()
     if mode == "NON_FOCUS" and focus_dates:
         focus_set = set(focus_dates)
-        dates_to_show = [d for d in sorted(trades_by_date.keys()) if d not in focus_set]
-        non_focus_count = sum(len(trades_by_date[d]) for d in dates_to_show)
+        candidate_dates = set(trades_by_date.keys()) | set(extra_dates or [])
+        dates_to_show = sorted(d for d in candidate_dates if d not in focus_set)
+        non_focus_count = sum(len(trades_by_date.get(d, [])) for d in dates_to_show)
         header_sub = (
             f"Total Trades in Sample: {len(result.trades)} | "
-            f"Non-Focus Trades Shown ({len(dates_to_show)} dates): {non_focus_count}"
+            f"Non-Focus Dates Shown ({len(dates_to_show)} dates, {non_focus_count} executed on {result.symbol})"
         )
     elif mode == "FOCUS" and focus_dates:
         dates_to_show = focus_dates
@@ -264,39 +266,78 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
         f"   NQ Range: {df_nq_1m.index[0]} -> {df_nq_1m.index[-1]} ({len(df_nq_1m)} bars)"
     )
 
-    shared_dates_exp_fixed: Dict[Any, Any] = {}
-    shared_dates_grade_b: Dict[Any, Any] = {}
-    shared_dates_grade_a: Dict[Any, Any] = {}
-
-    all_results: List[BacktestResult] = []
-    for sym, df_prim, df_sec, default_sl in (
-        ("ES", df_es_1m, df_nq_1m, 5.5),
-        ("NQ", df_nq_1m, df_es_1m, 42.0),
-    ):
-        print(f"\n2. Running Backtest Suite for {sym}...")
-        engine = BacktestEngine(
-            symbol=sym,
+    engines = {
+        "ES": BacktestEngine(
+            symbol="ES",
             initial_capital=100_000.0,
             commission_per_contract=2.00,
             slippage_ticks=1,
             swing_confirmation_bars=2,
+        ),
+        "NQ": BacktestEngine(
+            symbol="NQ",
+            initial_capital=100_000.0,
+            commission_per_contract=2.00,
+            slippage_ticks=1,
+            swing_confirmation_bars=2,
+        ),
+    }
+
+    def _run_cross_index_pair(
+        strat_name: str,
+        make_strategy_fn,
+    ) -> Tuple[BacktestResult, ICTMultiTimeframeStrategy, BacktestResult, ICTMultiTimeframeStrategy]:
+        # Pass 1: Independent discovery (no ES-first bias)
+        s_es_p1 = make_strategy_fn(5.5, None)
+        s_es_p1.name = strat_name
+        r_es_p1 = engines["ES"].run(df_es_1m, strategy=s_es_p1, df_secondary=df_nq_1m, precompute_domain=True)
+
+        s_nq_p1 = make_strategy_fn(42.0, None)
+        s_nq_p1.name = strat_name
+        r_nq_p1 = engines["NQ"].run(df_nq_1m, strategy=s_nq_p1, df_secondary=df_es_1m, precompute_domain=True)
+
+        # Arbitrate dates where both ES and NQ triggered (time lead -> leader vs. consolidator)
+        blocked_for_es, blocked_for_nq = ICTExperienceLayer.resolve_cross_index_winners(
+            r_es_p1, r_nq_p1, df_es_1m, df_nq_1m, tie_window_minutes=0
         )
 
-        res_bh = engine.run(df_prim, strategy=BuyAndHoldStrategy(quantity=1), precompute_domain=False)
-        res_rand = engine.run(
-            df_prim,
-            strategy=RandomEntryStrategy(
-                stop_loss_points=default_sl,
-                take_profit_points=default_sl * 2.0,
-                quantity=1,
-                seed=42,
-            ),
-            precompute_domain=False,
-        )
-        sym_results: List[BacktestResult] = [res_bh, res_rand]
+        # Pass 2: Locked portfolio run (instant — domain already cached in RAM)
+        s_es = make_strategy_fn(5.5, blocked_for_es)
+        s_es.name = strat_name
+        r_es = engines["ES"].run(df_es_1m, strategy=s_es, df_secondary=df_nq_1m, precompute_domain=True)
 
-        if RUN_ABLATION_COMPARISON:
-            # Layer 1 Only: Pure Mechanical Entry Model + Fixed Set-and-Forget SL
+        s_nq = make_strategy_fn(42.0, blocked_for_nq)
+        s_nq.name = strat_name
+        r_nq = engines["NQ"].run(df_nq_1m, strategy=s_nq, df_secondary=df_es_1m, precompute_domain=True)
+        return r_es, s_es, r_nq, s_nq
+
+    es_results: List[BacktestResult] = []
+    nq_results: List[BacktestResult] = []
+
+    for sym, df_prim, default_sl, bucket in (
+        ("ES", df_es_1m, 5.5, es_results),
+        ("NQ", df_nq_1m, 42.0, nq_results),
+    ):
+        print(f"\n2. Running Baselines for {sym}...")
+        bucket.append(engines[sym].run(df_prim, strategy=BuyAndHoldStrategy(quantity=1), precompute_domain=False))
+        bucket.append(
+            engines[sym].run(
+                df_prim,
+                strategy=RandomEntryStrategy(
+                    stop_loss_points=default_sl,
+                    take_profit_points=default_sl * 2.0,
+                    quantity=1,
+                    seed=42,
+                ),
+                precompute_domain=False,
+            )
+        )
+
+    if RUN_ABLATION_COMPARISON:
+        for sym, df_prim, df_sec, default_sl, bucket in (
+            ("ES", df_es_1m, df_nq_1m, 5.5, es_results),
+            ("NQ", df_nq_1m, df_es_1m, 42.0, nq_results),
+        ):
             ict_pure = ICTMultiTimeframeStrategy(
                 stop_loss_points=default_sl,
                 reward_risk_ratio=2.0,
@@ -315,11 +356,12 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
                 experience_config=ExperienceConfig.pure_strategy(),
             )
             ict_pure.name = "ICT_PureStrategy (Fixed SL)"
-            res_pure = engine.run(df_prim, strategy=ict_pure, df_secondary=df_sec, precompute_domain=True)
+            bucket.append(engines[sym].run(df_prim, strategy=ict_pure, df_secondary=df_sec, precompute_domain=True))
 
-            # Layer 1 + Layer 2: Strategy + Full Experience + Partials + Fixed SL (Trailing OFF)
-            ict_exp_fixed = ICTMultiTimeframeStrategy(
-                stop_loss_points=default_sl,
+        r_es_ef, _, r_nq_ef, _ = _run_cross_index_pair(
+            "ICT_Strategy+Exp (Fixed SL)",
+            lambda sl, shared: ICTMultiTimeframeStrategy(
+                stop_loss_points=sl,
                 reward_risk_ratio=2.0,
                 min_rr=1.65,
                 min_tp1_rr=0.80,
@@ -333,16 +375,17 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
                 min_grade="A",
                 require_killzone=True,
                 max_trades_per_day=1,
-                shared_daily_trade_dates=shared_dates_exp_fixed,
+                shared_daily_trade_dates=shared,
                 experience_config=ExperienceConfig.full(),
-            )
-            ict_exp_fixed.name = "ICT_Strategy+Exp (Fixed SL)"
-            res_exp_fixed = engine.run(df_prim, strategy=ict_exp_fixed, df_secondary=df_sec, precompute_domain=True)
+            ),
+        )
+        es_results.append(r_es_ef)
+        nq_results.append(r_nq_ef)
 
-            sym_results.extend([res_pure, res_exp_fixed])
-
-        ict_all_grades = ICTMultiTimeframeStrategy(
-            stop_loss_points=default_sl,
+    r_es_b, _, r_nq_b, _ = _run_cross_index_pair(
+        "ICT_Strategy (Allow Grade B)",
+        lambda sl, shared: ICTMultiTimeframeStrategy(
+            stop_loss_points=sl,
             reward_risk_ratio=2.0,
             min_rr=1.65,
             min_tp1_rr=0.80,
@@ -356,14 +399,17 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
             min_grade="B",
             require_killzone=True,
             max_trades_per_day=1,
-            shared_daily_trade_dates=shared_dates_grade_b,
+            shared_daily_trade_dates=shared,
             experience_config=ExperienceConfig.full(),
-        )
-        ict_all_grades.name = "ICT_Strategy (Allow Grade B)"
-        res_b = engine.run(df_prim, strategy=ict_all_grades, df_secondary=df_sec, precompute_domain=True)
+        ),
+    )
+    es_results.append(r_es_b)
+    nq_results.append(r_nq_b)
 
-        ict_a_only = ICTMultiTimeframeStrategy(
-            stop_loss_points=default_sl,
+    r_es_a, strat_es_a, r_nq_a, strat_nq_a = _run_cross_index_pair(
+        "ICT_Strategy (Grade A/A+ Only)",
+        lambda sl, shared: ICTMultiTimeframeStrategy(
+            stop_loss_points=sl,
             reward_risk_ratio=2.0,
             min_rr=1.65,
             min_tp1_rr=0.80,
@@ -377,17 +423,25 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
             min_grade="A",
             require_killzone=True,
             max_trades_per_day=1,
-            shared_daily_trade_dates=shared_dates_grade_a,
+            shared_daily_trade_dates=shared,
             experience_config=ExperienceConfig.full(),
-        )
-        ict_a_only.name = "ICT_Strategy (Grade A/A+ Only)"
-        res_a = engine.run(df_prim, strategy=ict_a_only, df_secondary=df_sec, precompute_domain=True)
+        ),
+    )
+    es_results.append(r_es_a)
+    nq_results.append(r_nq_a)
 
-        _print_tradingview_audit_log(
-            res_a, ict_a_only, focus_dates=FOCUS_AUDIT_DATES, audit_mode=AUDIT_MODE
-        )
-        sym_results.extend([res_b, res_a])
-        all_results.extend(sym_results)
+    pair_trade_dates = sorted(
+        {t.entry_time.strftime("%Y-%m-%d") for t in r_es_a.trades}
+        | {t.entry_time.strftime("%Y-%m-%d") for t in r_nq_a.trades}
+    )
+    _print_tradingview_audit_log(
+        r_es_a, strat_es_a, focus_dates=FOCUS_AUDIT_DATES, audit_mode=AUDIT_MODE, extra_dates=pair_trade_dates
+    )
+    _print_tradingview_audit_log(
+        r_nq_a, strat_nq_a, focus_dates=FOCUS_AUDIT_DATES, audit_mode=AUDIT_MODE, extra_dates=pair_trade_dates
+    )
+
+    all_results: List[BacktestResult] = es_results + nq_results
 
     print("=" * 114)
     print(
@@ -415,7 +469,6 @@ def main() -> None:
         generate_synthetic_pair_data(es_data_path, nq_data_path, num_bars=1500)
 
     run_backtest_suite(es_data_path, nq_data_path)
-
 
 if __name__ == "__main__":
     main()

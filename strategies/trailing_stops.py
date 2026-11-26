@@ -40,11 +40,11 @@ class ICTStructuralTrailingStop(BaseTrailingStopManager):
     """
 
     def on_bar_manage(
-        self,
-        ctx: BarContext,
-        position: Position,
-        broker: SimulatedBroker,
-        portfolio: Portfolio,
+            self,
+            ctx: BarContext,
+            position: Position,
+            broker: SimulatedBroker,
+            portfolio: Portfolio,
     ) -> None:
         pos: Position = position
         if ctx.timestamp <= pos.entry_time:
@@ -86,7 +86,7 @@ class ICTStructuralTrailingStop(BaseTrailingStopManager):
                     if s["type"] == "SwingLow"
                        and s["time"] >= pos.entry_time
                        and (pos.entry_price - 0.15 * risk_pts) <= float(s["price"]) <= (
-                                   pos.entry_price + 0.35 * risk_pts)
+                               pos.entry_price + 0.35 * risk_pts)
                 ]
                 if be_swings:
                     best_be = max(be_swings, key=lambda x: x["time"])
@@ -103,7 +103,7 @@ class ICTStructuralTrailingStop(BaseTrailingStopManager):
                     if s["type"] == "SwingHigh"
                        and s["time"] >= pos.entry_time
                        and (pos.entry_price - 0.35 * risk_pts) <= float(s["price"]) <= (
-                                   pos.entry_price + 0.15 * risk_pts)
+                               pos.entry_price + 0.15 * risk_pts)
                 ]
                 if be_swings:
                     best_be = max(be_swings, key=lambda x: x["time"])
@@ -124,6 +124,7 @@ class ICTStructuralTrailingStop(BaseTrailingStopManager):
                 break
 
         last_trail_ts = pos.metadata.get("last_trail_event_time", pos.entry_time)
+        already_structurally_trailed = "last_trail_event_time" in pos.metadata
         last_trailed_pivot_ts = pos.metadata.get("last_trailed_pivot_time", pos.entry_time)
 
         # Advance `window_anchor_ts` to the most recent partial exit (TP1 or TP2) that occurred
@@ -238,10 +239,13 @@ class ICTStructuralTrailingStop(BaseTrailingStopManager):
         if len(window_df) < 2:
             return
 
-        # If we already trailed after TP1 and price rallied to a new interim peak before pulling back
-        # and breaking that peak (e.g. Oct 8 ES Long: 10:18 -> 10:23 peak @ 7842.25 -> 10:27 pullback @ 7838.00 -> 10:28 BOS),
-        # slice the pullback window starting from that interim peak so we trail under the new pullback low (10:27 @ 7838.00).
-        if already_trailed_after_tp1 and cont_event.get("kind") != "IFVG_RECLAIM" and len(window_df) >= 5:
+        # If we already trailed (post-TP1, or single-TP after a counter-BOS) and price rallied to a new
+        # interim peak before pulling back and breaking that peak, slice from that interim peak forward
+        # so we trail under the new pullback pivot rather than the prior breakout wick.
+        allow_peak_slice = already_trailed_after_tp1 or (
+                (not has_planned_partials) and already_structurally_trailed and had_counter_bos
+        )
+        if allow_peak_slice and cont_event.get("kind") != "IFVG_RECLAIM" and len(window_df) >= 5:
             prior_sub = window_df.iloc[:-1]
             if pos.direction == "LONG":
                 peak_ts = prior_sub["high"].idxmax()
@@ -307,6 +311,8 @@ class ICTStructuralTrailingStop(BaseTrailingStopManager):
                 cand_sl = min(raw_new_sl, pos.entry_price + 0.35 * risk_pts)
             elif valid_second_pre_tp1_trail and raw_new_sl <= (pos.entry_price + 0.15 * risk_pts):
                 cand_sl = raw_new_sl
+            elif (not has_planned_partials) and already_structurally_trailed and had_counter_bos:
+                cand_sl = raw_new_sl
             else:
                 if raw_new_sl > pos.entry_price:
                     return
@@ -367,6 +373,8 @@ class ICTStructuralTrailingStop(BaseTrailingStopManager):
             elif tp1_hit or progress_to_full_tp >= 0.75:
                 cand_sl = max(raw_new_sl, pos.entry_price - 0.35 * risk_pts)
             elif valid_second_pre_tp1_trail and raw_new_sl >= (pos.entry_price - 0.15 * risk_pts):
+                cand_sl = raw_new_sl
+            elif (not has_planned_partials) and already_trailed_once and had_counter_bos:
                 cand_sl = raw_new_sl
             else:
                 if raw_new_sl < pos.entry_price:
