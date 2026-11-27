@@ -276,6 +276,7 @@ class ICTExperienceLayer:
             df_es_1m: pd.DataFrame,
             df_nq_1m: pd.DataFrame,
             tie_window_minutes: int = 0,
+            verbose: bool = False,
     ) -> Tuple[Dict[Any, Any], Dict[Any, Any]]:
         """
         Resolves daily cross-index exclusivity with zero lookahead bias:
@@ -311,11 +312,12 @@ class ICTExperienceLayer:
                 winner = "NQ" if nq_score > es_score else "ES"
                 reason = "same-bar leader_score"
 
-            print(
-                f"   ⚖️  [Cross-Index {d}] ES {t_es.direction}@{t_es.entry_time.strftime('%H:%M')} [{es_det}] "
-                f"vs NQ {t_nq.direction}@{t_nq.entry_time.strftime('%H:%M')} [{nq_det}] "
-                f"--> WINNER: {winner} ({reason})"
-            )
+            if verbose:
+                print(
+                    f"   ⚖️  [Cross-Index {d}] ES {t_es.direction}@{t_es.entry_time.strftime('%H:%M')} [{es_det}] "
+                    f"vs NQ {t_nq.direction}@{t_nq.entry_time.strftime('%H:%M')} [{nq_det}] "
+                    f"--> WINNER: {winner} ({reason})"
+                )
 
             if winner == "ES":
                 blocked_for_nq[d] = ("ES", t_es.entry_time)
@@ -523,6 +525,69 @@ class ICTExperienceLayer:
                     )
         return None
 
+    def check_counter_trend_distant_target_filter(
+            self,
+            direction: str,
+            retrace_type: str,
+            t_15m: str,
+            htf_aligned_count: int,
+            target_info: Dict[str, Any],
+    ) -> Optional[str]:
+        """
+        Rejects pure 1m counter-5m SMT reversals (`SMT_REVERSAL_MODEL`) when 15m is
+        also against the trade, HTF is not aligned (< 2 aligned), FullTP is >= 3.0R,
+        and even the FIRST available target (TP1 or FullTP) is >= 2.0R away.
+        """
+        if not (self.config.enable_discretionary_targets and self.config.enable_exhaustion_filter):
+            return None
+
+        wanted_bias = "BULLISH" if direction == "LONG" else "BEARISH"
+        is_15m_opposite = t_15m not in (wanted_bias, "NEUTRAL")
+        planned_rr = float(target_info.get("rr", 0.0))
+        partials = target_info.get("partial_targets", [])
+        first_target_rr = float(partials[0]["rr"]) if partials else planned_rr
+
+        if (
+                retrace_type == "SMT_REVERSAL_MODEL"
+                and is_15m_opposite
+                and htf_aligned_count < 2
+                and planned_rr >= 3.00
+                and first_target_rr >= 2.00
+        ):
+            return (
+                f"Counter-trend 1m SMT reversal against {t_15m} 15m/5m structure with mixed/opposing HTF "
+                f"({htf_aligned_count}/3 aligned) and no nearby partial (< 2.00R; first target at "
+                f"{first_target_rr:.2f}R, FullTP at {planned_rr:.2f}R -> {target_info['target_type']})."
+            )
+        return None
+
+    def check_laggard_index_smt_filter(
+            self,
+            direction: str,
+            retrace_type: str,
+            trend_5m: str,
+            sec_trend_5m: str,
+    ) -> Optional[str]:
+        """
+        Zero-lookahead leader-vs-laggard gate:
+        Rejects a counter-5m `SMT_REVERSAL_MODEL` entry on the lagging index
+        when the companion index's 5m structure is already aligned in the trade direction.
+        """
+        if not self.config.enable_cross_index_exclusivity:
+            return None
+
+        wanted_bias = "BULLISH" if direction == "LONG" else "BEARISH"
+        if (
+                retrace_type == "SMT_REVERSAL_MODEL"
+                and trend_5m != wanted_bias
+                and sec_trend_5m == wanted_bias
+        ):
+            return (
+                f"Laggard index block: primary 5m is still {trend_5m} while companion index "
+                f"5m is already {sec_trend_5m} (defer counter-5m SMT entry to leading index)."
+            )
+        return None
+
     # ------------------------------------------------------------------
     # 4. Symbol-Specific Structural SL Heuristics
     # ------------------------------------------------------------------
@@ -570,20 +635,20 @@ class ICTExperienceLayer:
     # 5. Discretionary Target & Partial Take-Profit Heuristics
     # ------------------------------------------------------------------
     def select_discretionary_target(
-        self,
-        ctx: BarContext,
-        direction: str,
-        fill_price: float,
-        actual_risk_pts: float,
-        all_directional_targets: List[Dict[str, Any]],
-        min_rr: float,
-        min_tp1_rr: float,
-        max_rr: float,
-        partial_cut_pct: float,
-        enable_partials: bool,
-        reward_risk_ratio: float,
-        allow_opening_range_target: bool = False,
-        allow_exception_tp1: bool = False,
+            self,
+            ctx: BarContext,
+            direction: str,
+            fill_price: float,
+            actual_risk_pts: float,
+            all_directional_targets: List[Dict[str, Any]],
+            min_rr: float,
+            min_tp1_rr: float,
+            max_rr: float,
+            partial_cut_pct: float,
+            enable_partials: bool,
+            reward_risk_ratio: float,
+            allow_opening_range_target: bool = False,
+            allow_exception_tp1: bool = False,
     ) -> Tuple[Optional[Dict[str, Any]], str]:
         # 3. Confirmed NY Opening Range Swing Target (Strictly when 5m + 1m SMT align, e.g., Oct 14 09:51 NQ Short)
         if allow_opening_range_target and ctx.confirmed_swings:
@@ -842,6 +907,20 @@ class ICTExperienceLayer:
 
             return best, ""
 
+        # Fallback: Tier-2 lower-TF targets (regular 15MIN_POOL, priority == 3).
+        # Passed to grade_setup() strictly as Grade B so Grade A/A+ logs the full
+        # Grade B rejection (15m target + exhaustion/HTF cons) while Allow Grade B tracks them.
+        if self.config.enable_grading:
+            tier2_candidates = [
+                c for c in all_directional_targets
+                if c["priority"] == 3 and full_tp_min_rr <= c["rr"] <= max_rr
+            ]
+            if tier2_candidates:
+                tier2_candidates.sort(key=lambda x: x["rr"])
+                best = dict(tier2_candidates[0])
+                best["partial_targets"] = []
+                return best, ""
+
         if len(ctx.history_df) < 25:
             default_tp = (
                 fill_price + (actual_risk_pts * reward_risk_ratio)
@@ -1003,29 +1082,104 @@ class ICTExperienceLayer:
     # ------------------------------------------------------------------
     @staticmethod
     def grade_setup(
-        direction: str,
-        target_info: Dict[str, Any],
-        retracement_type: str,
-        retracement_pts: int,
-        has_smt: bool,
-        has_macro_sweep: bool,
-        has_structural_sweep: bool,
-        htf_trends: Dict[str, str],
-        liquidity_taken_level: str,
-        has_cross_index_htf_smt_alignment: bool = False,
+            direction: str,
+            target_info: Dict[str, Any],
+            retracement_type: str,
+            retracement_pts: int,
+            has_smt: bool,
+            has_macro_sweep: bool,
+            has_structural_sweep: bool,
+            htf_trends: Dict[str, str],
+            liquidity_taken_level: str,
+            has_cross_index_htf_smt_alignment: bool = False,
     ) -> Tuple[str, int, List[str], List[str]]:
-        return grade_setup(
-            direction=direction,
-            target_info=target_info,
-            retracement_type=retracement_type,
-            retracement_pts=retracement_pts,
-            has_smt=has_smt,
-            has_macro_sweep=has_macro_sweep,
-            has_structural_sweep=has_structural_sweep,
-            htf_trends=htf_trends,
-            liquidity_taken_level=liquidity_taken_level,
-            has_cross_index_htf_smt_alignment=has_cross_index_htf_smt_alignment,
-        )
+        score = 0
+        pros: List[str] = []
+        cons: List[str] = []
+
+        prio = int(target_info.get("priority", 1))
+        if prio == 1:
+            score += 3
+            pros.append(f"Tier-1 Primary Target ({target_info['target_type']}, RR={target_info['rr']:.2f})")
+        elif prio == 2:
+            score += 2
+            pros.append(f"Intraday / 15m Equal H/L Target ({target_info['target_type']}, RR={target_info['rr']:.2f})")
+        else:
+            score += 1
+            cons.append(f"Tier-2 Lower-TF Target ({target_info['target_type']}, RR={target_info['rr']:.2f})")
+
+        score += retracement_pts
+        if retracement_pts >= 3:
+            pros.append(f"Strong Entry / Retracement Model ({retracement_type})")
+        elif retracement_pts == 2:
+            pros.append("5m Fibonacci OTE Retracement")
+        else:
+            cons.append("1m Counter-BOS Pullback Only (No 5m FVG/EQ Mitigated)")
+
+        if has_smt:
+            score += 2
+            pros.append("Confirmed SMT Divergence Catalyst")
+        elif has_macro_sweep:
+            score += 2
+            pros.append("Macro Session Liquidity Sweep Catalyst")
+        elif has_structural_sweep:
+            score += 1
+            pros.append("HTF Structural Liquidity Sweep Catalyst")
+        else:
+            score -= 1
+            cons.append("No Prior Opposite-Side Sweep / SMT Manipulation")
+
+        wanted_bias = "BULLISH" if direction == "LONG" else "BEARISH"
+        t_4h = htf_trends.get("4h", "NEUTRAL")
+        t_1h = htf_trends.get("1h", "NEUTRAL")
+        t_15m = htf_trends.get("15min", "NEUTRAL")
+
+        aligned_count = sum(1 for t_bias in (t_4h, t_1h, t_15m) if t_bias == wanted_bias)
+        neutral_count = sum(1 for t_bias in (t_4h, t_1h, t_15m) if t_bias == "NEUTRAL")
+
+        if aligned_count >= 2 or neutral_count == 3:
+            score += 2
+            pros.append(f"HTF Structure Aligned (4H={t_4h}, 1H={t_1h}, 15m={t_15m})")
+        elif aligned_count == 1 and has_cross_index_htf_smt_alignment:
+            score += 2
+            pros.append(
+                f"HTF Structure Aligned via Confirmed 1H/4H SMT & Companion HTF MSS (4H={t_4h}, 1H={t_1h}, 15m={t_15m})")
+        elif aligned_count == 1:
+            score += 1
+            cons.append(f"Mixed HTF Structure (4H={t_4h}, 1H={t_1h}, 15m={t_15m})")
+        elif has_smt or "WEEKEND_GAP" in target_info["target_type"]:
+            score += 1
+            cons.append(
+                f"Counter-HTF on Primary Index (4H={t_4h}, 1H={t_1h}, 15m={t_15m} — Overridden by Confirmed Cross-Index SMT)"
+            )
+        else:
+            score -= 1
+            cons.append(f"Counter-HTF Structure (4H={t_4h}, 1H={t_1h}, 15m={t_15m})")
+
+        if liquidity_taken_level == "HIGH":
+            score -= 1 if has_smt else 3
+            cons.append("High Cross-Index Session/HTF Liquidity Already Taken Prior to Entry")
+        elif liquidity_taken_level == "MEDIUM":
+            pros.append("Medium Pre-Entry Liquidity Taken (Primary Targets Intact)")
+        else:
+            pros.append("Low Pre-Entry Liquidity Exhaustion (Clean Draw Ahead)")
+
+        if prio >= 3:
+            grade = "B"
+        elif liquidity_taken_level == "HIGH" and not has_smt:
+            grade = "B"
+        elif liquidity_taken_level == "HIGH" and has_smt:
+            grade = "A" if score >= 5 else "B"
+        elif score >= 9 and prio == 1:
+            grade = "A+"
+        elif score >= 7 and prio <= 2:
+            grade = "A/A+"
+        elif score >= 5:
+            grade = "A"
+        else:
+            grade = "B"
+
+        return grade, score, pros, cons
 
     def passes_grade_filter(self, grade: str, min_grade: str) -> bool:
         if not self.config.enable_grading:

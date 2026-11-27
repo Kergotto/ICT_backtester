@@ -26,7 +26,7 @@ BACKTEST_END_DATE: Optional[str] = "2026-10-27 17:00:00"
 RUN_ABLATION_COMPARISON: bool = True
 
 # Audit log filter mode: "FOCUS" (9 focus dates), "NON_FOCUS" (Phase 2 false-positive review), or "ALL"
-AUDIT_MODE: str = "NON_FOCUS"
+AUDIT_MODE: str = "FOCUS"
 
 # Focus dates from your manual TradingView journal
 FOCUS_AUDIT_DATES: Optional[List[str]] = [
@@ -41,6 +41,17 @@ FOCUS_AUDIT_DATES: Optional[List[str]] = [
     "2026-10-26",
 ]
 
+# Non-focus dates under audit
+NON_FOCUS_AUDIT_DATES: List[str] = [
+    "2026-09-29",
+    "2026-10-05",
+    "2026-10-07",
+    "2026-10-09",
+    "2026-10-12",
+    "2026-10-19",
+    "2026-10-23",
+    "2026-10-27",
+]
 
 def generate_synthetic_pair_data(
     es_path: Path, nq_path: Path, num_bars: int = 1500
@@ -433,6 +444,7 @@ def run_backtest_suite(es_path: Path, nq_path: Path) -> None:
     pair_trade_dates = sorted(
         {t.entry_time.strftime("%Y-%m-%d") for t in r_es_a.trades}
         | {t.entry_time.strftime("%Y-%m-%d") for t in r_nq_a.trades}
+        | set(NON_FOCUS_AUDIT_DATES)
     )
     _print_tradingview_audit_log(
         r_es_a, strat_es_a, focus_dates=FOCUS_AUDIT_DATES, audit_mode=AUDIT_MODE, extra_dates=pair_trade_dates

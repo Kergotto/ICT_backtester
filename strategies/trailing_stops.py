@@ -276,7 +276,8 @@ class ICTStructuralTrailingStop(BaseTrailingStopManager):
                 s for s in ctx.confirmed_swings
                 if s["type"] == "SwingLow" and eff_window_start <= s["time"] < pullback_time
             ]
-            swept_cluster = sum(1 for s in prior_swings if pullback_low < float(s["price"])) >= 1
+            min_cluster_swings = 1 if already_trailed_after_tp1 else 2
+            swept_cluster = sum(1 for s in prior_swings if pullback_low < float(s["price"])) >= min_cluster_swings
             cluster_touches = int((window_df["low"] <= (pullback_low + buffer_pts)).sum())
 
             had_internal_counter_break = any(
@@ -335,11 +336,13 @@ class ICTStructuralTrailingStop(BaseTrailingStopManager):
             else:
                 pullback_time = window_df["high"].idxmax()
 
+            prior_swing_start = pos.entry_time if already_trailed_after_tp1 else eff_window_start
             prior_swings = [
                 s for s in ctx.confirmed_swings
-                if s["type"] == "SwingHigh" and pos.entry_time <= s["time"] < pullback_time
+                if s["type"] == "SwingHigh" and prior_swing_start <= s["time"] < pullback_time
             ]
-            swept_cluster = sum(1 for s in prior_swings if pullback_high > float(s["price"])) >= 1
+            min_cluster_swings = 1 if already_trailed_after_tp1 else 2
+            swept_cluster = sum(1 for s in prior_swings if pullback_high > float(s["price"])) >= min_cluster_swings
             cluster_touches = int((window_df["high"] >= (pullback_high - buffer_pts)).sum())
 
             had_internal_counter_break = any(

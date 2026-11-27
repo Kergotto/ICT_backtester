@@ -215,15 +215,15 @@ class BacktestEngine:
     _SOURCE_CODE_HASH_CACHE: Optional[str] = None
 
     def __init__(
-        self,
-        symbol: str = "ES",
-        initial_capital: float = 100_000.0,
-        commission_per_contract: float = 2.00,
-        slippage_ticks: int = 1,
-        swing_confirmation_bars: int = 2,
-        enable_stage_profiling: bool = True,
-        bypass_cache: bool = False,
-        cache_dir: str | Path = "data/cache",
+            self,
+            symbol: str = "ES",
+            initial_capital: float = 100_000.0,
+            commission_per_contract: float = 2.00,
+            slippage_ticks: int = 1,
+            swing_confirmation_bars: int = 2,
+            enable_stage_profiling: bool = False,
+            bypass_cache: bool = False,
+            cache_dir: str | Path = "data/cache",
     ):
         self.symbol = symbol.upper()
         self.initial_capital = float(initial_capital)
@@ -1043,7 +1043,8 @@ class BacktestEngine:
                         sw_liq_high_ns = [_ts_to_ns(sw["time"]) for sw in sw_liq_highs]
 
                         raw_htf_candidates: List[
-                            Tuple[LiquidityPool, float, pd.Timestamp, bool, Optional[Tuple[Optional[str], Optional[pd.Timestamp]]]]
+                            Tuple[LiquidityPool, float, pd.Timestamp, bool, Optional[
+                                Tuple[Optional[str], Optional[pd.Timestamp]]], bool]
                         ] = []
                         for p in liq_htf.get_all_pools():
                             p_price = self._get_pool_price(p)
@@ -1052,7 +1053,18 @@ class BacktestEngine:
                                 p.pool_type, p_price, scan_start_ts, htf_times, htf_highs, htf_lows, htf_closes,
                                 times_1m_ns=htf_times_ns,
                             )
-                            raw_htf_candidates.append((p, p_price, p.creation_time, False, (res_type_base, res_ts_base)))
+
+                            # Genuine Equal Highs/Lows require >= 2 touches separated by an opposing swing on the same TF
+                            is_valid_eq_hl = False
+                            if p.touches >= 2 and p.last_touch_time is not None and p.last_touch_time > p.creation_time:
+                                opp_ns = sw_liq_low_ns if p.pool_type == "BSL" else sw_liq_high_ns
+                                lo_opp = bisect.bisect_right(opp_ns, _ts_to_ns(p.creation_time))
+                                hi_opp = bisect.bisect_left(opp_ns, _ts_to_ns(p.last_touch_time))
+                                is_valid_eq_hl = hi_opp > lo_opp
+
+                            raw_htf_candidates.append(
+                                (p, p_price, p.creation_time, False, (res_type_base, res_ts_base), is_valid_eq_hl)
+                            )
 
                             if res_ts_base is not None:
                                 p_cre_ns = _ts_to_ns(p.creation_time)
@@ -1081,7 +1093,9 @@ class BacktestEngine:
                                         touches=p.touches,
                                         source="Structural",
                                     )
-                                    raw_htf_candidates.append((new_pool, sw_p, latest_sw["time"], False, None))
+                                    raw_htf_candidates.append(
+                                        (new_pool, sw_p, latest_sw["time"], False, None, is_valid_eq_hl)
+                                    )
 
                         # Include 15m pullback-bounce highs (e.g. Oct 8 02:00 @ 7845.25 -> 7845.00 pool)
                         if tf_rule == "15min" and len(df_htf) >= 5:
@@ -1108,9 +1122,10 @@ class BacktestEngine:
                                         touches=1,
                                         source="Structural",
                                     )
-                                    raw_htf_candidates.append((new_pool, sw_p, t_15[k_15], True, None))
+                                    raw_htf_candidates.append((new_pool, sw_p, t_15[k_15], True, None, False))
                                 if (
                                         c_15[k_15 - 1] > o_15[k_15 - 1]
+                                        and (c_15[k_15] < o_15[k_15] or l_15[k_15] < o_15[k_15 - 1])
                                         and l_15[k_15] < c_15[k_15 - 1]
                                         and l_15[k_15] < l_15[k_15 + 1]
                                         and l_15[k_15] < l_15[k_15 + 2]
@@ -1124,10 +1139,11 @@ class BacktestEngine:
                                         touches=1,
                                         source="Structural",
                                     )
-                                    raw_htf_candidates.append((new_pool, sw_p, t_15[k_15], True, None))
+                                    raw_htf_candidates.append((new_pool, sw_p, t_15[k_15], True, None, False))
 
-                        for p, p_price, orig_creation_ts, is_tp_only, cached_res in raw_htf_candidates:
-                            conf_ts = orig_creation_ts + confirm_lag
+                        tp_only_confirm_lag = pd.Timedelta(minutes=tf_min * 3 - 1)
+                        for p, p_price, orig_creation_ts, is_tp_only, cached_res, is_valid_eq_hl in raw_htf_candidates:
+                            conf_ts = orig_creation_ts + (tp_only_confirm_lag if is_tp_only else confirm_lag)
                             if cached_res is not None:
                                 res_type, res_ts = cached_res
                             else:
@@ -1153,7 +1169,7 @@ class BacktestEngine:
                             if is_duplicate:
                                 continue
 
-                            is_eq_hl = p.touches >= 2
+                            is_eq_hl = is_valid_eq_hl
                             effective_tier = 1 if (tier_num == 1 or is_eq_hl) else 2
                             t_type = (
                                 f"EQUAL_HL_{tf_rule.upper()}"
@@ -1265,7 +1281,8 @@ class BacktestEngine:
             len(df_secondary) if df_secondary is not None else 0,
         )
         if self._domain_cache_key == cache_key and self._domain_cache is not None:
-            print(f"   ⚡ Reusing cached multi-TF ICT domain for {self.symbol} (0.00s)...")
+            if self.enable_stage_profiling:
+                print(f"   ⚡ Reusing cached multi-TF ICT domain for {self.symbol} (0.00s)...")
             return self._domain_cache
 
         disk_cache_file: Optional[Path] = None
@@ -1278,7 +1295,8 @@ class BacktestEngine:
                     with open(disk_cache_file, "rb") as f:
                         bundle = pickle.load(f)
                     load_s = pytime.perf_counter() - t_load
-                    print(f"   ⚡ Loaded cached multi-TF ICT domain for {self.symbol} from disk ({load_s:.2f}s)...")
+                    if self.enable_stage_profiling:
+                        print(f"   ⚡ Loaded cached multi-TF ICT domain for {self.symbol} from disk ({load_s:.2f}s)...")
                     self._domain_cache_key = cache_key
                     self._domain_cache = bundle
                     return bundle
@@ -1422,7 +1440,8 @@ class BacktestEngine:
                 BacktestEngine._GLOBAL_SMT_CACHE[smt_key] = smt_events
 
         elapsed = pytime.perf_counter() - t0
-        print(f"   ⚡ Precomputed multi-TF ICT domain for {self.symbol} in {elapsed:.2f}s (cached)...")
+        if self.enable_stage_profiling:
+            print(f"   ⚡ Precomputed multi-TF ICT domain for {self.symbol} in {elapsed:.2f}s (cached)...")
         if self.enable_stage_profiling and len(df_primary) >= 100:
             if smt_prof.get("cache_hit"):
                 smt_str = "SMT=CACHE_HIT"

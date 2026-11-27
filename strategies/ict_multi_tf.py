@@ -274,12 +274,12 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         self.trailing_stop_manager.on_bar_manage(ctx, pos, broker, portfolio)
 
     def _evaluate_retracement_and_trigger(
-        self,
-        ctx: BarContext,
-        direction: str,
-        is_5m_trend_aligned: bool,
-        has_intraday_post_open_smt: bool,
-        is_ath_bullish_regime: bool = False,
+            self,
+            ctx: BarContext,
+            direction: str,
+            is_5m_trend_aligned: bool,
+            has_intraday_post_open_smt: bool,
+            is_ath_bullish_regime: bool = False,
     ) -> Tuple[bool, str, str, int, List[FairValueGap], str, str]:
         wanted_struct_dir = "BULLISH" if direction == "LONG" else "BEARISH"
         opposite_struct_dir = "BEARISH" if direction == "LONG" else "BULLISH"
@@ -324,15 +324,17 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                         "",
                     )
                 return False, "NONE", "", 0, [], trigger_desc, chase_fail
-            return (
-                False,
-                "NONE",
-                "",
-                0,
-                [],
-                trigger_desc,
-                f"5m trend is opposite ({ctx.htf_trends.get('5min')}) and no confirmed intraday post-09:30 {wanted_struct_dir.title()} SMT is active.",
-            )
+            if ctx.htf_trends.get("5min") == wanted_struct_dir:
+                misalign_reason = (
+                    f"5m is {wanted_struct_dir}, but all HTFs (4H/1H/15m) are opposing "
+                    f"and no confirmed intraday post-09:30 {wanted_struct_dir.title()} SMT is active."
+                )
+            else:
+                misalign_reason = (
+                    f"5m trend is opposite ({ctx.htf_trends.get('5min')}) "
+                    f"and no confirmed intraday post-09:30 {wanted_struct_dir.title()} SMT is active."
+                )
+            return False, "NONE", "", 0, [], trigger_desc, misalign_reason
 
         # MODEL 1: 5m Trend Continuation
         fvg_type_needed = "BISI" if direction == "LONG" else "SIBI"
@@ -374,7 +376,8 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                     touched_5m_fvgs.append(f)
                     fvg_5m_strs.append(desc_s)
 
-        dr_ref = ctx.active_dealing_range_5m if not is_short_synthetic else (ctx.active_dealing_range_5m or ctx.active_dealing_range)
+        dr_ref = ctx.active_dealing_range_5m if not is_short_synthetic else (
+                    ctx.active_dealing_range_5m or ctx.active_dealing_range)
         in_favorable_eq = False
         eq_detail_str = ""
         if dr_ref is not None and getattr(dr_ref, "direction", "") == wanted_struct_dir:
@@ -388,7 +391,8 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 in_favorable_eq = True
                 eq_detail_str = f"5m Bearish Range Premium EQ >= {eq_price:.2f} (Range [{dr_ref.low:.2f}-{dr_ref.high:.2f}])"
 
-        fib_ref = ctx.active_fib_range_5m if not is_short_synthetic else (ctx.active_fib_range_5m or ctx.active_fib_range)
+        fib_ref = ctx.active_fib_range_5m if not is_short_synthetic else (
+                    ctx.active_fib_range_5m or ctx.active_fib_range)
         in_ote = False
         ote_detail_str = ""
         if fib_ref is not None and fib_ref.direction == wanted_struct_dir:
@@ -413,7 +417,8 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
         for rf in getattr(ctx, "recent_fvgs_all", []):
             if rf.fvg_type == fvg_type_needed:
                 for ev_name, ev_ts, _ in rf.events:
-                    if ev_name == "INVERTED" and (confirm_event["close_time"] - pd.Timedelta(minutes=6)) <= ev_ts < confirm_event["close_time"]:
+                    if ev_name == "INVERTED" and (confirm_event["close_time"] - pd.Timedelta(minutes=6)) <= ev_ts < \
+                            confirm_event["close_time"]:
                         inverted_1m_fvg_desc = (
                             f"1m {rf.fvg_type} [{rf.bottom:.2f}-{rf.top:.2f}] inverted at {ev_ts.strftime('%H:%M')}"
                         )
@@ -719,6 +724,8 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
             ctx, price, t_4h, t_1h, t_15m, sec_4h, sec_1h, sec_15m
         )
 
+        sec_5m = ctx.sec_htf_trends.get("5min", trend_5m)
+
         all_active_smt_descriptions = [ev["description"] for ev in ctx.recent_smt_events]
 
         for direction in ("LONG", "SHORT"):
@@ -774,7 +781,20 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 )
                 continue
 
-            # Layer 2: Overextended Exhaustion-Leg Filter
+            # Layer 2 Filters: Leader-vs-Laggard Gate & Exhaustion-Leg Filter
+            laggard_msg = self.experience.check_laggard_index_smt_filter(
+                direction=direction,
+                retrace_type=retrace_type,
+                trend_5m=trend_5m,
+                sec_trend_5m=sec_5m,
+            )
+            if laggard_msg is not None:
+                self._log_diagnostic(
+                    date_str,
+                    f"[{t_hm}] {direction} ({trigger_desc}, {retrace_type}) -> Rejected: {laggard_msg}",
+                )
+                continue
+
             exhaustion_msg = self.experience.check_exhaustion_leg_filter(
                 ctx=ctx,
                 direction=direction,
@@ -834,6 +854,20 @@ class ICTMultiTimeframeStrategy(BaseStrategy):
                 self._log_diagnostic(
                     date_str,
                     f"[{t_hm}] {direction} ({trigger_desc}, {retrace_type}, SL={sl_price:.2f} [{sl_anchor_str}]) -> Rejected: {target_fail_reason}",
+                )
+                continue
+
+            distant_fade_reason = self.experience.check_counter_trend_distant_target_filter(
+                direction=direction,
+                retrace_type=retrace_type,
+                t_15m=t_15m,
+                htf_aligned_count=htf_aligned_count,
+                target_info=target_info,
+            )
+            if distant_fade_reason is not None:
+                self._log_diagnostic(
+                    date_str,
+                    f"[{t_hm}] {direction} ({trigger_desc}, {retrace_type}, SL={sl_price:.2f} [{sl_anchor_str}]) -> Rejected: {distant_fade_reason}",
                 )
                 continue
 
